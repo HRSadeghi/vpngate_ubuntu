@@ -41,6 +41,12 @@ class RecordingNet:
         self.applied = None
         self.bypasses: list[str] = []
         self.torn_down = False
+        self.original_route = ("192.168.1.1", "eth0")
+        self.state = None  # no app-bypass follow-up task in the fake
+        self.bypass_setup = None
+
+    def setup_app_bypass(self, routing, orig) -> None:
+        self.bypass_setup = (routing, orig)
 
     def apply(self, iface, lease, bypass_host, block_ipv6=True, mtu_override=None,
               routing=None, dns_proxy_address=None) -> None:

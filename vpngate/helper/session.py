@@ -45,10 +45,11 @@ class Resources:
         self.bridge: EthernetBridge | None = None
         self.renew_task: asyncio.Task | None = None
         self.counter_task: asyncio.Task | None = None
+        self.bypass_task: asyncio.Task | None = None
         self.tasks: list[asyncio.Task] = []
 
     def cancel_tasks(self) -> None:
-        for t in (self.counter_task, self.renew_task):
+        for t in (self.counter_task, self.renew_task, self.bypass_task):
             if t is not None:
                 t.cancel()
 
@@ -358,6 +359,7 @@ class VPNSession:
                   block_ipv6=config.blockIPv6, mtu_override=config.mtu,
                   routing=routing,
                   dns_proxy_address=dns_proxy.listen_address if dns_proxy else None)
+        net.setup_app_bypass(routing, net.original_route)
         if dns_proxy is not None:
             dns_proxy.tunnel_dns_servers = [ip_string(d) for d in lease.dns]
             dns_proxy.direct_dns_servers = net.direct_dns_servers()
@@ -418,6 +420,8 @@ class VPNSession:
 
         r.counter_task = loop.create_task(counter())
         r.renew_task = loop.create_task(renew())
+        if net.state is not None and net.state.app_bypass:
+            r.bypass_task = loop.create_task(net.rescan_loop())
 
     def _release(self, r: Resources) -> None:
         """Stops traffic first, then removes routes, then closes the tun. Safe more than once."""

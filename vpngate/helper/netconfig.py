@@ -7,11 +7,16 @@ and DNS is published through systemd-resolved (`resolvectl`) when it runs, with 
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
 import subprocess
 import time
+
+CGROUP_PATH = "/sys/fs/cgroup/vpngate-bypass"
+BYPASS_MARK = "0x5657"
+BYPASS_TABLE = "5657"
 
 
 def _log(tag: str, message: str) -> None:
@@ -35,6 +40,7 @@ class State:
     bypass_host: str
     gateway: str
     dns_set: bool = False
+    app_bypass: bool = False
     # `ip` argument lists that undo each route we really added, in the order they were added.
     # None in state files written by older versions (then everything is removed best-effort).
     added_routes: list[list[str]] | None = None
@@ -142,6 +148,11 @@ class NetConfig:
         self.dns = dns or DNSConfigurator(self.runner)
         self.state_file = state_file
         self.state: State | None = None
+        self.proc_root = "/proc"          # patchable for tests
+        self.cgroup_root = "/sys/fs/cgroup"  # patchable for tests
+        self._bypass_moved: set[int] = set()
+        self._bypass_apps: list[str] = []
+        self._bypass_active = False
         self.original_route: tuple[str | None, str] | None = None
         self.routing = RoutingConfig()
         self.tunnel_gateway: str | None = None
@@ -284,6 +295,7 @@ class NetConfig:
             _log("[ip]", f"-6 addr add {IPv6.string(address)} failed ({r[0]}): {r[1].strip()}")
 
     def teardown(self) -> None:
+        self._teardown_app_bypass()
         self._cleanup(self.state, self.runner, self.dns)
         self.state = None
         self.original_route = None
@@ -307,8 +319,28 @@ class NetConfig:
         except (OSError, ValueError, TypeError):
             return
         NetConfig._cleanup(st, runner, dns)
+        if getattr(st, "app_bypass", False):
+            NetConfig._cleanup_app_bypass_stale(runner)
         try:
             os.remove(state_file)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _cleanup_app_bypass_stale(runner: CommandRunner) -> None:
+        ipt = shutil.which("iptables")
+        ip6t = shutil.which("ip6tables")
+        spec = ["-m", "cgroup", "--path", "vpngate-bypass", "-j", "MARK",
+                "--set-mark", BYPASS_MARK]
+        if ipt:
+            runner.run(ipt, ["-t", "mangle", "-D", "OUTPUT", *spec])
+        if ip6t:
+            runner.run(ip6t, ["-t", "mangle", "-D", "OUTPUT", *spec])
+        runner.run(_ip_path(), ["rule", "del", "fwmark", BYPASS_MARK,
+                                "table", BYPASS_TABLE, "priority", "5000"])
+        runner.run(_ip_path(), ["route", "flush", "table", BYPASS_TABLE])
+        try:
+            os.rmdir(CGROUP_PATH)
         except OSError:
             pass
 
@@ -341,9 +373,180 @@ class NetConfig:
                     "added_routes": self.state.added_routes,
                     "resolv_conf_backup": self.state.resolv_conf_backup,
                     "tun_iface": self.state.tun_iface,
+                    "app_bypass": self.state.app_bypass,
                 }, f)
         except OSError:
             pass
+
+    # MARK: application bypass (split tunneling by app)
+    #
+    # Selected applications keep their normal internet while the VPN is connected: a cgroup
+    # v2 group collects the apps' processes, an iptables cgroup match marks their packets,
+    # and an fwmark policy rule routes marked packets over the original default gateway —
+    # ahead of the 0.0.0.0/1+128.0.0.0/1 tunnel capture. Only NEW connections of a moved
+    # process are affected (the socket's cgroup is fixed at creation).
+
+    def setup_app_bypass(self, routing: RoutingConfig | None,
+                         orig: tuple[str | None, str] | None) -> None:
+        """Enables or clears app bypass according to `routing`; safe to call repeatedly."""
+        enabled = bool(routing and routing.bypass_apps_enabled and routing.bypass_apps)
+        if not enabled:
+            self._teardown_app_bypass()
+            return
+        ipt = shutil.which("iptables")
+        ip6t = shutil.which("ip6tables")
+        if not ipt or orig is None:
+            _log("[bypass]", "iptables or the original route is unavailable; app bypass off")
+            self._teardown_app_bypass()
+            return
+        cgroup = os.path.join(self.cgroup_root, "vpngate-bypass")
+        if not os.path.isdir(self.cgroup_root):
+            _log("[bypass]", "no cgroup filesystem; app bypass off")
+            self._teardown_app_bypass()
+            return
+        try:
+            os.makedirs(cgroup, exist_ok=True)
+        except OSError as e:
+            _log("[bypass]", f"cannot create {cgroup}: {e}")
+            return
+
+        self._bypass_apps = [a.strip() for a in routing.bypass_apps if a.strip()]
+        spec = ["-m", "cgroup", "--path", "vpngate-bypass", "-j", "MARK",
+                "--set-mark", BYPASS_MARK]
+        # v4
+        if self.runner.run(ipt, ["-t", "mangle", "-C", "OUTPUT", *spec])[0] != 0:
+            self.runner.run(ipt, ["-t", "mangle", "-A", "OUTPUT", *spec])
+        # v6 (only when the physical network has IPv6; otherwise v6 stays blocked anyway)
+        if ip6t and self.default_route6() is not None:
+            if self.runner.run(ip6t, ["-t", "mangle", "-C", "OUTPUT", *spec])[0] != 0:
+                self.runner.run(ip6t, ["-t", "mangle", "-A", "OUTPUT", *spec])
+
+        rules_now = self.runner.run(_ip_path(), ["rule", "show"])[1]
+        if f"fwmark {BYPASS_MARK}" not in rules_now:
+            self.runner.run(_ip_path(), ["rule", "add", "fwmark", BYPASS_MARK,
+                                         "table", BYPASS_TABLE, "priority", "5000"])
+        # Mirror the original default route (and its connected route) into the bypass table.
+        o_gw, o_iface = orig
+        if o_gw:
+            self.runner.run(_ip_path(), ["route", "replace", "default", "via", o_gw,
+                                         "dev", o_iface, "table", BYPASS_TABLE])
+        else:
+            self.runner.run(_ip_path(), ["route", "replace", "default", "dev", o_iface,
+                                         "table", BYPASS_TABLE])
+        rc, out = self.runner.run(_ip_path(), ["route", "show", "dev", o_iface])
+        for line in out.splitlines():
+            t = line.strip()
+            if t.startswith("default") or "scope link" not in t:
+                continue
+            self.runner.run(_ip_path(), ["route", "replace", *t.split(), "table", BYPASS_TABLE])
+            break
+
+        self.rescan_app_bypass()
+        self._bypass_active = True
+        if self.state is not None:
+            self.state.app_bypass = True
+            self._save()
+
+    def default_route6(self) -> tuple[str | None, str] | None:
+        rc, out = self.runner.run(_ip_path(), ["-6", "route", "show", "default"])
+        if rc != 0 or not out.strip():
+            return None
+        gw = iface = None
+        toks = out.split()
+        for i, tok in enumerate(toks):
+            if tok == "via" and i + 1 < len(toks):
+                gw = toks[i + 1]
+            if tok == "dev" and i + 1 < len(toks):
+                iface = toks[i + 1]
+        return (gw, iface) if iface else None
+
+    def _bypass_matches(self, comm: str, exe: str) -> bool:
+        low = comm.lower()
+        for app in self._bypass_apps:
+            a = app.lower()
+            base = a.rsplit("/", 1)[-1]
+            if low == a.rsplit("/", 1)[-1] or low == base or (exe and exe.lower() == a) \
+                    or (exe and exe.lower().rsplit("/", 1)[-1] == base):
+                return True
+        return False
+
+    def rescan_app_bypass(self) -> int:
+        """Moves processes of bypassed apps into the cgroup; returns the number newly moved.
+        Cheap enough to run every few seconds for the whole /proc."""
+        if not self.state or not self.state.app_bypass or not self._bypass_apps:
+            return 0
+        cgroup = os.path.join(self.cgroup_root, "vpngate-bypass")
+        if not os.path.isdir(cgroup):
+            return 0
+        moved = 0
+        try:
+            entries = os.listdir(self.proc_root)
+        except OSError:
+            return 0
+        for entry in entries:
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            if pid in self._bypass_moved:
+                continue
+            try:
+                with open(f"{self.proc_root}/{entry}/comm", "rb") as f:
+                    comm = f.read().decode("utf-8", "replace").strip()
+                try:
+                    exe = os.readlink(f"{self.proc_root}/{entry}/exe")
+                except OSError:
+                    exe = ""
+            except OSError:
+                continue
+            if not comm or not self._bypass_matches(comm, exe):
+                continue
+            try:
+                with open(f"{cgroup}/cgroup.procs", "ab") as f:
+                    f.write(f"{pid}\n".encode())
+                self._bypass_moved.add(pid)
+                moved += 1
+            except OSError:
+                continue
+        if moved:
+            _log("[bypass]", f"moved {moved} new process(es) into the bypass cgroup")
+        return moved
+
+    def _teardown_app_bypass(self) -> None:
+        if not self._bypass_active:
+            self._bypass_apps = []
+            self._bypass_moved = set()
+            return
+        self._bypass_active = False
+        ipt = shutil.which("iptables")
+        ip6t = shutil.which("ip6tables")
+        spec = ["-m", "cgroup", "--path", "vpngate-bypass", "-j", "MARK",
+                "--set-mark", BYPASS_MARK]
+        if ipt:
+            self.runner.run(ipt, ["-t", "mangle", "-D", "OUTPUT", *spec])
+        if ip6t:
+            self.runner.run(ip6t, ["-t", "mangle", "-D", "OUTPUT", *spec])
+        self.runner.run(_ip_path(), ["rule", "del", "fwmark", BYPASS_MARK,
+                                     "table", BYPASS_TABLE, "priority", "5000"])
+        self.runner.run(_ip_path(), ["route", "flush", "table", BYPASS_TABLE])
+        try:
+            os.rmdir(os.path.join(self.cgroup_root, "vpngate-bypass"))
+        except OSError:
+            pass
+        self._bypass_apps = []
+        self._bypass_moved = set()
+        if self.state is not None and getattr(self.state, "app_bypass", False):
+            self.state.app_bypass = False
+            self._save()
+
+    def rescan_loop(self, interval: float = 3.0):
+        async def _loop():
+            while True:
+                await asyncio.sleep(interval)
+                try:
+                    self.rescan_app_bypass()
+                except Exception as e:  # never kill the session over the bypass scan
+                    _log("[bypass]", f"rescan failed: {e}")
+        return _loop()
 
     def default_route(self) -> tuple[str | None, str] | None:
         """(gateway, iface) of the current default route; gateway None when on-link."""

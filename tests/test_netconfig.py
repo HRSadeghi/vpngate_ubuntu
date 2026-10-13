@@ -28,6 +28,8 @@ class RecordingRunner:
     def run(self, path: str, args: list[str]) -> tuple[int, str]:
         self.calls.append((path, tuple(args)))
         key = " ".join(args)
+        if "-C" in args:  # rule-existence checks: pretend nothing exists yet
+            return 1, ""
         if any(f in key for f in self.fail):
             return 1, "failed"
         if args[:2] == ["route", "show"] or "route" in args[:2]:
@@ -212,6 +214,60 @@ class NetConfigTests(unittest.TestCase):
         for path, args in runner.calls:
             if "resolvectl" in args:
                 self.fail(f"resolvectl must not be invoked via {path}: {args}")
+
+    def test_app_bypass_commands_and_cleanup(self):
+        import tempfile
+        from vpngate.core.routing import RoutingConfig
+        cfg = RoutingConfig(bypass_apps_enabled=True, bypass_apps=["firefox"])
+        self._apply()
+        cgroup_dir = tempfile.mkdtemp()  # stands in for /sys/fs/cgroup
+        self.net.cgroup_root = cgroup_dir
+        self.runner.fail.clear()
+        self.net.setup_app_bypass(cfg, ("192.168.1.1", "eth0"))
+        text = self._argv_text()
+        self.assertIn("-t mangle -A OUTPUT -m cgroup --path vpngate-bypass -j MARK "
+                      "--set-mark 0x5657", text)
+        self.assertIn("rule add fwmark 0x5657 table 5657 priority 5000", text)
+        self.assertIn("route replace default via 192.168.1.1 dev eth0 table 5657", text)
+        self.assertTrue(self.net.state.app_bypass)
+        self.net.teardown()
+        text = self._argv_text()
+        self.assertIn("-t mangle -D OUTPUT -m cgroup --path vpngate-bypass -j MARK "
+                      "--set-mark 0x5657", text)
+        self.assertIn("rule del fwmark 0x5657 table 5657 priority 5000", text)
+        self.assertIn("route flush table 5657", text)
+
+    def test_app_bypass_rescan_moves_matching_processes(self):
+        import tempfile
+        from vpngate.core.routing import RoutingConfig
+        cfg = RoutingConfig(bypass_apps_enabled=True, bypass_apps=["firefox"])
+        self._apply()
+        cgroup_dir = tempfile.mkdtemp()
+        proc_dir = tempfile.mkdtemp()
+        os.makedirs(f"{cgroup_dir}/vpngate-bypass")
+        os.makedirs(f"{proc_dir}/123")
+        with open(f"{proc_dir}/123/comm", "w") as f:
+            f.write("firefox")
+        os.makedirs(f"{proc_dir}/456")
+        with open(f"{proc_dir}/456/comm", "w") as f:
+            f.write("gimp")
+        self.net.cgroup_root = cgroup_dir
+        self.net.proc_root = proc_dir
+        self.net.setup_app_bypass(cfg, ("192.168.1.1", "eth0"))
+        moved = self.net.rescan_app_bypass()
+        self.assertEqual(moved, 1)
+        procs = open(f"{cgroup_dir}/vpngate-bypass/cgroup.procs").read()
+        self.assertIn("123", procs)
+        self.assertNotIn("456", procs)
+        # already moved: rescan is a no-op
+        self.assertEqual(self.net.rescan_app_bypass(), 0)
+
+    def test_app_bypass_off_does_nothing(self):
+        from vpngate.core.routing import RoutingConfig
+        self._apply()
+        before = len(self.runner.calls)
+        self.net.setup_app_bypass(RoutingConfig(), ("192.168.1.1", "eth0"))
+        self.assertEqual(len(self.runner.calls), before)
 
     def test_mask_to_prefix(self):
         self.assertEqual(_mask_to_prefix(0xFFFFFF00), 24)

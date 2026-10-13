@@ -113,11 +113,17 @@ class RoutingConfig:
     rules: list[RoutingRule] = field(default_factory=list)
     default_action: RoutingAction = RoutingAction.proxy
     bypass_private_networks: bool = False
+    # Split tunneling by application: processes whose comm / executable basename matches one
+    # of these entries keep their normal (non-tunnel) internet while the VPN is connected.
+    bypass_apps_enabled: bool = False
+    bypass_apps: list[str] = field(default_factory=list)
 
     @property
     def is_empty(self) -> bool:
         """True when this config changes nothing (plain full-tunnel behaviour)."""
         return (not self.rules and not self.bypass_private_networks
+                and not self.bypass_apps_enabled
+                and not self.bypass_apps
                 and self.default_action == RoutingAction.proxy)
 
     @property

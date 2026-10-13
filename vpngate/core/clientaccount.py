@@ -35,7 +35,7 @@ DEFAULT_PORTS = [443, 992, 5555, 1194]
 def routing_config_to_json(cfg: RoutingConfig | None) -> dict | None:
     if cfg is None:
         return None
-    return {
+    out = {
         "rules": [
             {"id": r.id, "type": r.type.value, "value": r.value,
              "action": r.action.value, "enabled": r.enabled}
@@ -44,6 +44,10 @@ def routing_config_to_json(cfg: RoutingConfig | None) -> dict | None:
         "defaultAction": cfg.default_action.value,
         "bypassPrivateNetworks": cfg.bypass_private_networks,
     }
+    if cfg.bypass_apps_enabled or cfg.bypass_apps:
+        out["bypassAppsEnabled"] = cfg.bypass_apps_enabled
+        out["bypassApps"] = list(cfg.bypass_apps)
+    return out
 
 
 def routing_config_from_json(d: dict | None) -> RoutingConfig:
@@ -66,7 +70,9 @@ def routing_config_from_json(d: dict | None) -> RoutingConfig:
     except ValueError:
         default = RoutingAction.proxy
     return RoutingConfig(rules=rules, default_action=default,
-                         bypass_private_networks=bool(d.get("bypassPrivateNetworks", False)))
+                         bypass_private_networks=bool(d.get("bypassPrivateNetworks", False)),
+                         bypass_apps_enabled=bool(d.get("bypassAppsEnabled", False)),
+                         bypass_apps=[str(a) for a in d.get("bypassApps") or []][:64])
 
 
 @dataclass
