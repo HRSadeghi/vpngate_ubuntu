@@ -200,6 +200,16 @@ class ServerListWindow(Gtk.ApplicationWindow):
         self.search_entry.connect("search-changed", self._on_search_changed)
         header.pack_end(self.search_entry)
 
+        settings_btn = Gtk.Button(tooltip_text="Settings (proxy, routing, bypass apps…)")
+        theme = Gtk.IconTheme.get_default()
+        if theme.has_icon("emblem-system-symbolic"):
+            settings_btn.set_image(Gtk.Image.new_from_icon_name(
+                "emblem-system-symbolic", Gtk.IconSize.BUTTON))
+        else:
+            settings_btn.set_label("⚙ Settings")
+        settings_btn.connect("clicked", lambda _b: self.app.open_settings())
+        header.pack_end(settings_btn)
+
         self._filter_menu = None
         self._filter_menu_sig = None
         self.set_titlebar(header)
