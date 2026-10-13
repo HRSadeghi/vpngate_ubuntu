@@ -78,6 +78,9 @@ class DNSConfigurator:
             r = self.runner.run(resolvectl, ["domain", iface, "~."])
             ok2 = r[0] == 0
             self.runner.run(resolvectl, ["default-route", iface, "yes"])
+            # Flush cached (possibly censored/poisoned) answers gathered while the tunnel was
+            # down — otherwise every lookup keeps returning the stale poisoned IP for hours.
+            self.runner.run(resolvectl, ["flush-caches"])
             ok = ok1 and ok2
             if not ok:
                 _log("[dns]", "publishing resolver through resolvectl failed: " + r[1].strip())

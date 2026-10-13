@@ -51,7 +51,7 @@ class RecordingDNS(DNSConfigurator):
     def set(self, servers, iface, address, router):
         calls = []
         for args in (("dns", iface, *servers), ("domain", iface, "~."),
-                     ("default-route", iface, "yes")):
+                     ("default-route", iface, "yes"), ("flush-caches",)):
             self.runner.calls.append(("resolvectl", tuple(args)))
             calls.append(args)
         return True
@@ -210,6 +210,7 @@ class NetConfigTests(unittest.TestCase):
         self.assertIn(("dns", "vpngate0", "8.8.8.8"), resolvectl_calls)
         self.assertIn(("domain", "vpngate0", "~."), resolvectl_calls)
         self.assertIn(("default-route", "vpngate0", "yes"), resolvectl_calls)
+        self.assertIn(("flush-caches",), resolvectl_calls)  # poisoned cached answers must go
         # and never through the ip binary
         for path, args in runner.calls:
             if "resolvectl" in args:
