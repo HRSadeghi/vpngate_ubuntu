@@ -165,41 +165,38 @@ class ServerListWindow(Gtk.ApplicationWindow):
         title.get_style_context().add_class("title")
         header.set_custom_title(title)
 
+        # Toolbar buttons with icon + label (the Accounts window style — discoverable).
+        def tool_button(label, icon, tooltip, callback):
+            box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            box.pack_start(Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.BUTTON),
+                           False, False, 0)
+            box.pack_start(Gtk.Label(label=label), False, False, 0)
+            btn = Gtk.Button(tooltip_text=tooltip)
+            btn.add(box)
+            btn.connect("clicked", callback)
+            return btn
+
         # Filter menu: Country ▸ / Logging ▸ / Favorites only / Clear Filters
-        self.filter_button = Gtk.MenuButton()
-        self.filter_button.set_tooltip_text("Filter")
-        try:
-            self.filter_button.set_image(Gtk.Image.new_from_icon_name(
-                "open-menu-symbolic", Gtk.IconSize.BUTTON))
-        except Exception:
-            self.filter_button.set_label("☰")
+        self.filter_button = Gtk.MenuButton(tooltip_text="Filter (country, logging, favorites)")
+        filter_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        filter_box.pack_start(Gtk.Image.new_from_icon_name(
+            "open-menu-symbolic", Gtk.IconSize.BUTTON), False, False, 0)
+        filter_box.pack_start(Gtk.Label(label="Filter"), False, False, 0)
+        self.filter_button.add(filter_box)
         header.pack_start(self.filter_button)
 
-        details = Gtk.Button()
-        details.set_tooltip_text("Server details (⌘I)")
-        details.set_image(Gtk.Image.new_from_icon_name(
-            "dialog-information-symbolic", Gtk.IconSize.BUTTON))
-        details.connect("clicked", lambda _b: self._show_details())
-        header.pack_start(details)
-
-        test = Gtk.Button()
-        test.set_tooltip_text("Try a real VPN handshake with the listed servers and show the "
-                              "connect time from this computer")
-        test.set_image(Gtk.Image.new_from_icon_name(
-            "network-transmit-receive-symbolic", Gtk.IconSize.BUTTON))
-        test.connect("clicked", lambda _b: self.model.measure(self._visible_servers()))
-        header.pack_start(test)
-
-        refresh = Gtk.Button()
-        refresh.set_tooltip_text("Refresh List")
-        refresh.set_image(Gtk.Image.new_from_icon_name(
-            "view-refresh-symbolic", Gtk.IconSize.BUTTON))
-        refresh.connect("clicked", lambda _b: self.model.refresh())
-        header.pack_start(refresh)
+        header.pack_start(tool_button("Details", "dialog-information-symbolic",
+                                      "Server details (⌘I)", lambda _b: self._show_details()))
+        header.pack_start(tool_button(
+            "Test Connection", "network-transmit-receive-symbolic",
+            "Try a real VPN handshake with the listed servers and show the connect time "
+            "from this computer", lambda _b: self.model.measure(self._visible_servers())))
+        header.pack_start(tool_button("Refresh List", "view-refresh-symbolic",
+                                      "Refresh List", lambda _b: self.model.refresh()))
 
         self.search_entry = Gtk.SearchEntry()
         self.search_entry.set_placeholder_text("Search host, IP, country, operator")
-        self.search_entry.set_width_chars(28)
+        self.search_entry.set_width_chars(26)
         self.search_entry.connect("search-changed", self._on_search_changed)
         header.pack_end(self.search_entry)
 
