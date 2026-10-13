@@ -149,6 +149,16 @@ class VPNSession:
         )
         self.connect_config(cfg)
 
+    def set_bypass_apps(self, apps: list[str], enabled: bool) -> None:
+        """Live-apply the bypass list while connected (no reconnect needed)."""
+        if self._res is None or self._res.net is None:
+            return
+        try:
+            self._res.net.update_bypass_apps(apps, enabled)
+        except Exception as e:
+            from .logutil import log
+            log("[bypass]", f"live apply failed: {e}")
+
     def disconnect(self) -> None:
         self._generation += 1
         old = self._res

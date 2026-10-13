@@ -518,6 +518,12 @@ class AppModel:
     def set_routing_config(self, config) -> None:
         self.prefs.set("routingConfig", routing_config_to_json(config))
         self._changed()
+        # Live-apply app bypass while connected (no reconnect needed).
+        if self.is_connected:
+            r = HelperRequest(cmd="setBypassApps",
+                              bypassApps=config.bypass_apps,
+                              bypassAppsEnabled=config.bypass_apps_enabled)
+            self.helper.send(r)
 
     def refresh(self) -> bool:
         if self.loading:

@@ -269,6 +269,44 @@ class NetConfigTests(unittest.TestCase):
         self.net.setup_app_bypass(RoutingConfig(), ("192.168.1.1", "eth0"))
         self.assertEqual(len(self.runner.calls), before)
 
+    def test_teardown_returns_stranded_processes(self):
+        import tempfile
+        from vpngate.core.routing import RoutingConfig
+        cfg = RoutingConfig(bypass_apps_enabled=True, bypass_apps=["firefox"])
+        self._apply()
+        cgroup_dir = tempfile.mkdtemp()
+        self.net.cgroup_root = cgroup_dir
+        os.makedirs(f"{cgroup_dir}/vpngate-bypass")
+        # a process "stuck" in the cgroup (as if the helper crashed after moving it)
+        with open(f"{cgroup_dir}/vpngate-bypass/cgroup.procs", "w") as f:
+            f.write("123\n")
+        self.net._bypass_apps = ["firefox"]
+        self.net._bypass_active = True
+        if self.net.state:
+            self.net.state.app_bypass = True
+        self.net.teardown()
+        moved_back = open(f"{cgroup_dir}/cgroup.procs").read()
+        self.assertIn("123", moved_back)  # the stranded process was returned to the root cgroup
+
+    def test_update_bypass_apps_live(self):
+        from vpngate.core.routing import RoutingConfig
+        self._apply()
+        self.net.cgroup_root = tempfile.mkdtemp()
+        # the engine is armed at connect time (session._establish)
+        self.net.setup_app_bypass(
+            RoutingConfig(bypass_apps_enabled=True, bypass_apps=["firefox"]),
+            ("192.168.1.1", "eth0"))
+        self.net.update_bypass_apps(["firefox"], True)
+        self.assertEqual(self.net._bypass_apps, ["firefox"])
+        text = self._argv_text()
+        self.assertIn("-t mangle -A OUTPUT -m cgroup --path vpngate-bypass", text)
+        # disabling tears the whole setup down
+        self.net.update_bypass_apps([], False)
+        text = self._argv_text()
+        self.assertIn("-t mangle -D OUTPUT -m cgroup --path vpngate-bypass", text)
+        self.assertIn("rule del fwmark 0x5657", text)
+        self.assertFalse(self.net._bypass_active)
+
     def test_mask_to_prefix(self):
         self.assertEqual(_mask_to_prefix(0xFFFFFF00), 24)
         self.assertEqual(_mask_to_prefix(0xFFFF0000), 16)

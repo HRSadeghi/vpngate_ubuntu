@@ -126,6 +126,9 @@ class IPCServer:
                     routing=request.routing, ports=request.ports)
         elif request.cmd == "disconnect":
             self.session.disconnect()
+        elif request.cmd == "setBypassApps":
+            apps = [a.strip()[:256] for a in (request.bypassApps or []) if a.strip()][:64]
+            self.session.set_bypass_apps(apps, bool(request.bypassAppsEnabled))
         else:
             self._send(client, self.session.snapshot)
 

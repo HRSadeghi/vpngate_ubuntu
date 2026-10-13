@@ -153,6 +153,7 @@ class NetConfig:
         self._bypass_moved: set[int] = set()
         self._bypass_apps: list[str] = []
         self._bypass_active = False
+        self._app_bypass_config: RoutingConfig | None = None
         self.original_route: tuple[str | None, str] | None = None
         self.routing = RoutingConfig()
         self.tunnel_gateway: str | None = None
@@ -410,6 +411,7 @@ class NetConfig:
             _log("[bypass]", f"cannot create {cgroup}: {e}")
             return
 
+        self._app_bypass_config = routing
         self._bypass_apps = [a.strip() for a in routing.bypass_apps if a.strip()]
         spec = ["-m", "cgroup", "--path", "vpngate-bypass", "-j", "MARK",
                 "--set-mark", BYPASS_MARK]
@@ -470,6 +472,19 @@ class NetConfig:
                 return True
         return False
 
+    def update_bypass_apps(self, apps: list[str], enabled: bool) -> None:
+        """Live update of the bypass list (the user edited it while connected): re-runs the
+        whole setup/teardown with the new list, no reconnect needed."""
+        clean = [a.strip() for a in apps if a.strip()][:64]
+        if self._app_bypass_config is None:
+            return
+        cfg = RoutingConfig(bypass_apps_enabled=enabled, bypass_apps=clean,
+                            default_action=self._app_bypass_config.default_action,
+                            bypass_private_networks=self._app_bypass_config.bypass_private_networks)
+        self.setup_app_bypass(cfg, self.original_route)
+        _log("[bypass]", f"live update: {len(clean)} app(s), "
+                         f"{'enabled' if enabled and clean else 'disabled'}")
+
     def rescan_app_bypass(self) -> int:
         """Moves processes of bypassed apps into the cgroup; returns the number newly moved.
         Cheap enough to run every few seconds for the whole /proc."""
@@ -479,6 +494,7 @@ class NetConfig:
         if not os.path.isdir(cgroup):
             return 0
         moved = 0
+        moved_names: list[str] = []
         try:
             entries = os.listdir(self.proc_root)
         except OSError:
@@ -505,10 +521,11 @@ class NetConfig:
                     f.write(f"{pid}\n".encode())
                 self._bypass_moved.add(pid)
                 moved += 1
+                moved_names.append(f"{comm} (pid {pid})")
             except OSError:
                 continue
         if moved:
-            _log("[bypass]", f"moved {moved} new process(es) into the bypass cgroup")
+            _log("[bypass]", f"moved {moved} process(es): {', '.join(moved_names[:6])}")
         return moved
 
     def _teardown_app_bypass(self) -> None:
@@ -528,10 +545,27 @@ class NetConfig:
         self.runner.run(_ip_path(), ["rule", "del", "fwmark", BYPASS_MARK,
                                      "table", BYPASS_TABLE, "priority", "5000"])
         self.runner.run(_ip_path(), ["route", "flush", "table", BYPASS_TABLE])
+        # Move any stranded processes back to the root cgroup so nothing stays classified
+        # (and the cgroup can be removed).
+        procs_file = os.path.join(self.cgroup_root, "vpngate-bypass", "cgroup.procs")
         try:
-            os.rmdir(os.path.join(self.cgroup_root, "vpngate-bypass"))
+            with open(procs_file) as f:
+                stranded = [p for p in f.read().split() if p.strip()]
+            root_procs = os.path.join(self.cgroup_root, "cgroup.procs")
+            for pid in stranded:
+                try:
+                    with open(root_procs, "ab") as rf:
+                        rf.write(f"{pid}\n".encode())
+                except OSError:
+                    continue
+            if stranded:
+                _log("[bypass]", f"returned {len(stranded)} process(es) to the root cgroup")
         except OSError:
             pass
+        try:
+            os.rmdir(os.path.join(self.cgroup_root, "vpngate-bypass"))
+        except OSError as e:
+            _log("[bypass]", f"could not remove the bypass cgroup: {e}")
         self._bypass_apps = []
         self._bypass_moved = set()
         if self.state is not None and getattr(self.state, "app_bypass", False):

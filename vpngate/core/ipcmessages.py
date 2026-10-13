@@ -145,6 +145,8 @@ class HelperRequest:
     blockIPv6: bool | None = None
     routing: dict | None = None
     config: ConnectConfig | None = None
+    bypassApps: list[str] | None = None
+    bypassAppsEnabled: bool | None = None
 
     def to_json(self) -> dict:
         d: dict = {"cmd": self.cmd}
@@ -166,6 +168,10 @@ class HelperRequest:
         for key in ("host", "autoReconnect", "blockIPv6", "routing"):
             if key in d and d[key] is not None:
                 setattr(r, key, d[key])
+        if "bypassApps" in d and d["bypassApps"] is not None:
+            r.bypassApps = [str(a) for a in d["bypassApps"]]
+        if "bypassAppsEnabled" in d and d["bypassAppsEnabled"] is not None:
+            r.bypassAppsEnabled = bool(d["bypassAppsEnabled"])
         if "port" in d and d["port"] is not None:
             r.port = int(d["port"])
         if "ports" in d and d["ports"] is not None:
