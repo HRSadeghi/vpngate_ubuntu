@@ -389,14 +389,42 @@ class VPNSession:
         self._set(gen, ConnectionState.connected, ip=ip_string(lease.ip),
                   log=f"Connected via {tun.name}, gateway {ip_string(lease.router)}")
 
+        self._stall_base_in = None
+
         async def counter():
-            # 1 s events for the UI, 5 s throughput lines for the log file.
+            # 1 s events for the UI, 5 s throughput lines for the log file, and a stall
+            # detector: when the relay stops sending data entirely (capped session), say so
+            # in plain words instead of leaving the user with a silent dead connection.
             last_sample = (client.bytes_in, client.bytes_out)
             since_sample = time.monotonic()
+            last_nonzero_in = time.monotonic()
+            stall_warned = False
             while True:
                 await asyncio.sleep(1)
                 if not self._is_current(gen):
                     return
+                if client.bytes_in > 0:
+                    if stall_warned and client.bytes_in > self._stall_base_in:
+                        stall_warned = False  # data is flowing again
+                    if client.bytes_in > 0 and self._stall_base_in is None:
+                        self._stall_base_in = 0
+                if client.bytes_in > self._stall_base_in:
+                    last_nonzero_in = time.monotonic()
+                    self._stall_base_in = client.bytes_in
+                    stall_warned = False
+                elif not stall_warned and client.bytes_in > 0 \
+                        and time.monotonic() - last_nonzero_in >= 60:
+                    # Data flowed once and then stopped: the relay is capping this session.
+                    stall_warned = True
+                    log("[session]", "the relay has sent no data for 60 s — it is likely "
+                                     "throttling/capping this session; reconnect or switch "
+                                     "to another server")
+                    self._current.log = ("The relay stopped sending data (it may be capping "
+                                         "this session). Reconnect or pick another server.")
+                    self._current.helperVersion = HELPER_VERSION
+                    if self.emit is not None:
+                        self.emit(self._current)
+                    self._current.log = None
                 self._current.bytesIn = client.bytes_in
                 self._current.bytesOut = client.bytes_out
                 self._current.log = None
