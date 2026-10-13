@@ -96,6 +96,9 @@ class AppModel:
         self._loop_thread.start()
 
         self._wanted_server: VPNServer | None = None
+        self._relay_queue: list[VPNServer] = []
+        self._current_relay_id: str | None = None
+        self._last_failed_id: str | None = None
         self._reconnect_task: asyncio.Task | None = None
         self._history_entry: str | None = None
         self._history_bytes = (0, 0)
@@ -236,6 +239,20 @@ class AppModel:
             self.connected_at = None
         self._track_history(e)
         self.event = e
+        # Relay stall (the helper's 60 s no-data detector): the helper keeps the dead session
+        # up, so rotate to the next relay ourselves — disconnect, then the reconnect loop
+        # picks the next candidate.
+        if (e.state == ConnectionState.connected and e.log
+                and e.log.startswith("The relay stopped sending data")
+                and self._wanted_server is not None and self.active_account is None
+                and self.prefs.get("autoReconnect", True)
+                and self._reconnect_task is None):
+            self.append_log("Switching to another relay…")
+            self.helper.send(HelperRequest(cmd="disconnect"))
+            self.reconnect_attempts += 1
+            self._last_failed_id = self._current_relay_id
+            self._rotate_and_schedule(e.log)
+            return
         self._consider_reconnect(e)
         self._changed()
 
@@ -248,6 +265,35 @@ class AppModel:
 
     # MARK: reconnect (VPN Gate connections)
 
+    def _relay_candidates(self) -> list[VPNServer]:
+        """Relay failover queue: the wanted server first, then the best others (probed ones by
+        their test rank, otherwise by score). Volatile relays die mid-session; rotating keeps
+        the user online without manual babysitting."""
+        wanted = self._wanted_server
+        pool = [s for s in self._visible_servers_list()
+                if s.id != (wanted.id if wanted else None)]
+        pool.sort(key=lambda s: (ProbeOutcome.sort_rank(self.probes.get(s.id)), -s.score))
+        return ([wanted] if wanted is not None else []) + pool[:6]
+
+    def _visible_servers_list(self) -> list[VPNServer]:
+        return self.servers
+
+    def _next_relay(self) -> VPNServer | None:
+        """Pops the next candidate from the failover queue, skipping the relay that just
+        failed; refills from the server list when the queue runs dry."""
+        while self._relay_queue:
+            candidate = self._relay_queue.pop(0)
+            if candidate.id != self._last_failed_id \
+                    and candidate.ip in {s.ip for s in self.servers}:
+                return candidate
+        self._relay_queue = [c for c in self._relay_candidates()
+                             if c.id != self._last_failed_id]
+        while self._relay_queue:
+            candidate = self._relay_queue.pop(0)
+            if candidate.ip in {s.ip for s in self.servers}:
+                return candidate
+        return None
+
     def _consider_reconnect(self, e: HelperEvent) -> None:
         if e.state == ConnectionState.connected:
             self.reconnect_attempts = 0
@@ -257,18 +303,26 @@ class AppModel:
                 and self.active_account is None and self._reconnect_task is None):
             return
         self.reconnect_attempts += 1
-        server = self._wanted_server
+        self._last_failed_id = self._current_relay_id
+        self._rotate_and_schedule(e.error)
+
+    def _rotate_and_schedule(self, error: str | None) -> None:
+        """Picks the next relay from the failover queue and schedules the reconnect."""
+        server = self._next_relay() or self._wanted_server
+        if server is None:
+            return
         self.append_log(f"Reconnecting to {server.hostName} in "
-                        f"{int(-(-self.reconnect_delay // 1))} s (attempt {self.reconnect_attempts})")
+                        f"{int(-(-self.reconnect_delay // 1))} s "
+                        f"(attempt {self.reconnect_attempts})")
         waiting = HelperEvent(ConnectionState.reconnecting)
         waiting.server = server.ip
-        waiting.error = e.error
+        waiting.error = error
         self.event = waiting
         self._changed()
 
         async def wait_and_retry():
             await asyncio.sleep(self.reconnect_delay)
-            if self._wanted_server is None or self._wanted_server.id != server.id:
+            if self._wanted_server is None:
                 return
             if (not self.prefs.get("autoReconnect", True)
                     or self.event.state != ConnectionState.reconnecting
@@ -414,6 +468,7 @@ class AppModel:
         )
         r = HelperRequest(cmd="connect", config=cfg)
         self.last_server_id = s.id
+        self._current_relay_id = s.id  # failover tracking
         self.prefs.set("lastServerID", s.id)
         sent_at = time.time()
         self.helper.send(r)

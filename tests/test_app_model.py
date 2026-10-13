@@ -2,6 +2,7 @@
 
 import os
 import tempfile
+import time
 import unittest
 
 os.environ["VPNGATE_SUPPORT_DIR"] = tempfile.mkdtemp()
@@ -154,6 +155,48 @@ class AppModelWiringTests(unittest.TestCase):
         self.assertFalse(cfg.autoReconnect)
         self.assertEqual(cfg.ports, [443, 992])
         self.assertEqual(cfg.maxConnection, 1)
+
+    def test_reconnect_rotates_to_next_relay(self):
+        """Relays die constantly; the reconnect loop must rotate through candidates instead of
+        hammering the same dead server forever."""
+        model = self._model()
+        sent: list = []
+        model.helper.send = sent.append
+        model.helper_is_running = True
+        model.has_agreed_to_disclaimer = True
+        first = VPNServer(hostName="dead.example.com", ip="9.9.9.9", sslPorts=[443], score=5000)
+        second = VPNServer(hostName="alt.example.com", ip="8.8.8.8", sslPorts=[443], score=4000)
+        model.servers = [first, second]
+        model.connect(first)  # builds the failover queue [first, second]
+        self.assertEqual(sent[0].config.host, "9.9.9.9")
+        # the helper reports the connection dropped → next attempt rotates to the alt relay
+        model._handle_event(HelperEvent(ConnectionState.disconnected, error="Connection closed"))
+        time.sleep(0.3)  # let the app loop run the scheduled reconnect
+        self.assertEqual(sent[-1].config.host, "8.8.8.8")
+
+    def test_relay_stall_switches_to_next_relay(self):
+        """When the helper's 60 s no-data detector fires, the app disconnects the starved
+        session and immediately rotates to the next candidate relay."""
+        model = self._model()
+        sent: list = []
+        model.helper.send = sent.append
+        model.helper_is_running = True
+        model.has_agreed_to_disclaimer = True
+        first = VPNServer(hostName="capped.example.com", ip="9.9.9.9", sslPorts=[443], score=5000)
+        second = VPNServer(hostName="alt.example.com", ip="8.8.8.8", sslPorts=[443], score=4000)
+        model.servers = [first, second]
+        model.connect(first)
+        self.assertEqual(sent[0].config.host, "9.9.9.9")
+        model._handle_event(HelperEvent(ConnectionState.connected, server="9.9.9.9",
+                                        virtualIP="10.0.0.2", bytesIn=100, bytesOut=100))
+        # the helper's stall detector fires while still "connected"
+        model._handle_event(HelperEvent(
+            ConnectionState.connected, server="9.9.9.9", bytesIn=100, bytesOut=100,
+            log="The relay stopped sending data (it may be capping this session). "
+                "Reconnect or pick another server."))
+        time.sleep(0.3)  # let the app loop run the scheduled reconnect
+        self.assertTrue(any(r.cmd == "disconnect" for r in sent))
+        self.assertEqual(sent[-1].config.host, "8.8.8.8")
 
     def test_max_connection_preference_is_applied(self):
         model = self._model()
