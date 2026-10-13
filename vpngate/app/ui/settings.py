@@ -121,6 +121,13 @@ class SettingsWindow(Gtk.ApplicationWindow):
         stack.connect("notify::visible-child-name",
                       lambda st, _p: self.set_title(st.get_visible_child_name().title()))
 
+    @staticmethod
+    def _scrolled(child: Gtk.Widget) -> Gtk.Widget:
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroller.add(child)
+        return scroller
+
     # MARK: General
 
     def _general_tab(self) -> Gtk.Widget:
@@ -188,7 +195,7 @@ class SettingsWindow(Gtk.ApplicationWindow):
         vrows.add(note_row("It runs as root to create the VPN interface, routes and DNS. "
                            "The installer asks for your password once."))
         outer.pack_start(component, False, False, 0)
-        return outer
+        return self._scrolled(outer)
 
     def _on_launch_toggled(self, switch, _param) -> None:
         from ..helperinstaller import register_login_item, unregister_login_item
@@ -277,7 +284,7 @@ class SettingsWindow(Gtk.ApplicationWindow):
                           "Relay Servers which don't support the TCP port 443 as “SSL-VPN "
                           "Connection” from such a proxy-mandated network."))
         outer.pack_start(proxy_box, False, False, 0)
-        return outer
+        return self._scrolled(outer)
 
     # MARK: Routing
 
@@ -288,8 +295,8 @@ class SettingsWindow(Gtk.ApplicationWindow):
         outer.set_margin_top(6)
         outer.set_margin_bottom(14)
         editor = RoutingRulesEditor(self.model.routing_config, self._routing_changed, self)
-        outer.pack_start(editor, True, True, 0)
-        return outer
+        outer.pack_start(editor, False, False, 0)
+        return self._scrolled(outer)
 
     def _routing_changed(self, config) -> None:
         self.model.set_routing_config(config)

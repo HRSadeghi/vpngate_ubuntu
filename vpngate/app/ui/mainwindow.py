@@ -201,10 +201,20 @@ class ServerListWindow(Gtk.ApplicationWindow):
         header.pack_end(self.search_entry)
 
         self._filter_menu = None
+        self._filter_menu_sig = None
         self.set_titlebar(header)
 
     def _rebuild_filter_menu(self) -> None:
-        """Country ▸ / Logging ▸ / Favorites only / Clear Filters, with check marks."""
+        """Country ▸ / Logging ▸ / Favorites only / Clear Filters, with check marks.
+        Rebuilt only when the contents actually change: while connected the model emits an
+        event every second, and replacing the popup would close the open menu under the
+        user's cursor."""
+        signature = (tuple(sorted({s.countryLong for s in self.model.servers})),
+                     self.country, self.favorites_only,
+                     int(self.model.prefs.get("maxLogWeeks", -1) or -1))
+        if signature == self._filter_menu_sig:
+            return
+        self._filter_menu_sig = signature
         menu = Gtk.Menu()
 
         country_item = Gtk.MenuItem(label="Country")

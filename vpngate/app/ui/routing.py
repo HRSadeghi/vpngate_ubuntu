@@ -143,6 +143,9 @@ class RoutingRulesEditor(Gtk.Box):
         self.on_change = on_change
         self.parent_window = parent_window
 
+        # MARK: Bypass apps — first, it is the headline feature of this tab
+        self._build_bypass_group()
+
         # MARK: Unmatched traffic
         frame, inner = _group("Unmatched traffic")
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8,
@@ -196,9 +199,6 @@ class RoutingRulesEditor(Gtk.Box):
         add_btn.connect("clicked", lambda _b: self._add_rule())
         rules_inner.add(add_btn)
         _pack_group(self, rules_frame, head_label)
-
-        # MARK: Bypass apps
-        self._build_bypass_group()
 
         # MARK: explanation
         exp_frame, exp_inner = _group("")
