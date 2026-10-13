@@ -1,9 +1,11 @@
 """Server list window (port of ServerListView.swift): the Windows client's VPN Gate plug-in
-layout — header, connection card, filter bar, the relay table, and the Connect button.
+layout — header-bar toolbar (filter menu, details, test, refresh, search), header with the
+connection card, the relay table, and the Connect button.
 
 The table never clears its store: rows are added/updated/removed in place (cells read their
 values from the store; sorting is GTK-native over hidden numeric columns), so scrolling,
-selection and sort order survive every model event."""
+selection and sort order survive every model event. Cells that can change (probe results)
+always occupy the same number of lines so row heights never move under the viewport."""
 
 from __future__ import annotations
 
@@ -26,20 +28,21 @@ LOG_CHOICES = [("Any logging policy", -1), ("2 weeks or less", 2), ("Up to 1 mon
 (C_ID, C_IP, C_COUNTRY, C_UPTIME, C_SESSIONS, C_SPEED, C_PING, C_PROBE, C_LOGGING, C_SCORE,
  C_DDNS, C_SSL, C_UDP, C_TRAFFIC, C_USERS, C_OPERATOR, C_MESSAGE) = range(17)
 (S_IP, S_COUNTRY, S_UPTIME_MS, S_SESSIONS, S_SPEED, S_PING, S_PROBE_RANK, S_TRAFFIC,
- S_USERS) = range(17, 26)
+ S_USERS, S_SCORE) = range(17, 27)
 STORE_TYPES = (
     str,                                  # C_ID
     str, str,                             # C_IP, C_COUNTRY
     str, str, str, str,                   # C_UPTIME, C_SESSIONS, C_SPEED, C_PING
     str,                                  # C_PROBE
     str,                                  # C_LOGGING
-    int,                                  # C_SCORE
+    str,                                  # C_SCORE (grouped text)
     str, str, str,                        # C_DDNS, C_SSL, C_UDP
     str, str,                             # C_TRAFFIC, C_USERS
     str, str,                             # C_OPERATOR, C_MESSAGE
     str, str,                             # S_IP, S_COUNTRY
-    int, int, int, int, int, int, int,    # S_UPTIME_MS, S_SESSIONS, S_SPEED, S_PING,
-)                                         # S_PROBE_RANK, S_TRAFFIC, S_USERS
+    int, int, int, int,                   # S_UPTIME_MS, S_SESSIONS, S_SPEED, S_PING
+    int, int, int, int,                   # S_PROBE_RANK, S_TRAFFIC, S_USERS, S_SCORE
+)
 
 # (title, display column, sort column, default visible)
 COLUMNS = [
@@ -49,9 +52,9 @@ COLUMNS = [
     ("VPN Sessions", C_SESSIONS, S_SESSIONS, True),
     ("Line Speed", C_SPEED, S_SPEED, True),
     ("Ping (Google, SE)", C_PING, S_PING, True),
-    ("Test from this computer", C_PROBE, S_PROBE_RANK, True),
+    ("Test from this Mac", C_PROBE, S_PROBE_RANK, True),
     ("Logging Policy", C_LOGGING, C_LOGGING, True),
-    ("Total Score", C_SCORE, C_SCORE, True),
+    ("Total Score", C_SCORE, S_SCORE, True),
     ("DDNS Hostname", C_DDNS, C_DDNS, False),
     ("SSL-VPN (TCP)", C_SSL, None, False),
     ("UDP Support", C_UDP, None, False),
@@ -61,18 +64,17 @@ COLUMNS = [
     ("Operator's Message", C_MESSAGE, None, False),
 ]
 
+CARD_STYLES = {
+    ConnectionState.connected: ("vg-card-green", "🔒"),
+    ConnectionState.disconnected: ("vg-card-gray", "🔓"),
+}
+
 _I32_MAX = 2147483647
 
 
 def _i32(v: int) -> int:
     """GObject int store columns are 32-bit; clamp int64 values from the .dat."""
     return max(-_I32_MAX, min(_I32_MAX, int(v)))
-
-
-CARD_STYLES = {
-    ConnectionState.connected: ("vg-card-green", "🔒"),
-    ConnectionState.disconnected: ("vg-card-gray", "🔓"),
-}
 
 
 class ServerListWindow(Gtk.ApplicationWindow):
@@ -87,22 +89,21 @@ class ServerListWindow(Gtk.ApplicationWindow):
         self._updating = False
         self._iters: dict[str, Gtk.TreeIter] = {}
         self._row_cache: dict[str, tuple] = {}
-        self._countries_sig = None
         self._servers_by_id: dict[str, VPNServer] = {}
 
         self.set_default_size(980, 620)
         self._install_css()
+        self._build_headerbar()
+
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self.add(outer)
 
         outer.pack_start(self._build_header(), False, False, 0)
         outer.pack_start(Gtk.Separator(), False, False, 0)
-        outer.pack_start(self._build_filter_bar(), False, False, 0)
-        outer.pack_start(Gtk.Separator(), False, False, 0)
         self.status_label = Gtk.Label(xalign=0)
         self.status_label.set_margin_start(16)
-        self.status_label.set_margin_top(6)
-        self.status_label.set_margin_bottom(6)
+        self.status_label.set_margin_top(8)
+        self.status_label.set_margin_bottom(8)
         outer.pack_start(self.status_label, False, False, 0)
 
         scrolled = Gtk.ScrolledWindow()
@@ -118,7 +119,7 @@ class ServerListWindow(Gtk.ApplicationWindow):
             "<small><span foreground='gray'>Academic project at University of Tsukuba, Japan."
             "  ·  A server with a higher Line Speed and a smaller Ping is usually more "
             "comfortable to use.</span></small>")
-        footnote.set_xalign(0.5)
+        footnote.set_halign(Gtk.Align.CENTER)
         footnote.set_margin_bottom(6)
         outer.pack_start(footnote, False, False, 0)
 
@@ -142,12 +143,146 @@ class ServerListWindow(Gtk.ApplicationWindow):
                               border: 1px solid rgba(224,125,31,0.45); }
             .vg-card-title { font-weight: bold; font-size: 110%; }
             .vg-card-small { font-size: 90%; }
+            .vg-group { background: rgba(127,127,135,0.10); border-radius: 8px;
+                        padding: 4px; }
+            .vg-pill { border-radius: 999px; }
         """)
         screen = Gdk.Screen.get_default()
         Gtk.StyleContext.add_provider_for_screen(
             screen, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
-    # MARK: layout pieces
+    # MARK: header bar toolbar (filter menu, details, test, refresh, search)
+
+    def _build_headerbar(self) -> None:
+        header = Gtk.HeaderBar()
+        header.set_show_close_button(True)
+        header.set_has_subtitle(False)
+
+        title = Gtk.Label(label="VPN Gate Public VPN Relay Servers")
+        title.set_halign(Gtk.Align.START)
+        title.set_valign(Gtk.Align.CENTER)
+        title.set_hexpand(True)
+        title.get_style_context().add_class("title")
+        header.set_custom_title(title)
+
+        # Filter menu: Country ▸ / Logging ▸ / Favorites only / Clear Filters
+        self.filter_button = Gtk.MenuButton()
+        self.filter_button.set_tooltip_text("Filter")
+        try:
+            self.filter_button.set_image(Gtk.Image.new_from_icon_name(
+                "open-menu-symbolic", Gtk.IconSize.BUTTON))
+        except Exception:
+            self.filter_button.set_label("☰")
+        header.pack_start(self.filter_button)
+
+        details = Gtk.Button()
+        details.set_tooltip_text("Server details (⌘I)")
+        details.set_image(Gtk.Image.new_from_icon_name(
+            "dialog-information-symbolic", Gtk.IconSize.BUTTON))
+        details.connect("clicked", lambda _b: self._show_details())
+        header.pack_start(details)
+
+        test = Gtk.Button()
+        test.set_tooltip_text("Try a real VPN handshake with the listed servers and show the "
+                              "connect time from this computer")
+        test.set_image(Gtk.Image.new_from_icon_name(
+            "network-transmit-receive-symbolic", Gtk.IconSize.BUTTON))
+        test.connect("clicked", lambda _b: self.model.measure(self._visible_servers()))
+        header.pack_start(test)
+
+        refresh = Gtk.Button()
+        refresh.set_tooltip_text("Refresh List")
+        refresh.set_image(Gtk.Image.new_from_icon_name(
+            "view-refresh-symbolic", Gtk.IconSize.BUTTON))
+        refresh.connect("clicked", lambda _b: self.model.refresh())
+        header.pack_start(refresh)
+
+        self.search_entry = Gtk.SearchEntry()
+        self.search_entry.set_placeholder_text("Search host, IP, country, operator")
+        self.search_entry.set_width_chars(28)
+        self.search_entry.connect("search-changed", self._on_search_changed)
+        header.pack_end(self.search_entry)
+
+        self._filter_menu = None
+        self.set_titlebar(header)
+
+    def _rebuild_filter_menu(self) -> None:
+        """Country ▸ / Logging ▸ / Favorites only / Clear Filters, with check marks."""
+        menu = Gtk.Menu()
+
+        country_item = Gtk.MenuItem(label="Country")
+        country_menu = Gtk.Menu()
+        group: Gtk.RadioMenuItem | None = None
+        for value, label in [("All", "All countries")] + \
+                [(c, c) for c in sorted({s.countryLong for s in self.model.servers})]:
+            item = Gtk.RadioMenuItem(label=label, group=group)
+            group = group or item
+            if self.country == value:
+                item.set_active(True)
+            item.connect("toggled", self._on_country_menu, value)
+            country_menu.append(item)
+        country_item.set_submenu(country_menu)
+        menu.append(country_item)
+
+        logging_item = Gtk.MenuItem(label="Logging")
+        logging_menu = Gtk.Menu()
+        group = None
+        current_weeks = int(self.model.prefs.get("maxLogWeeks", -1) or -1)
+        for label, weeks in LOG_CHOICES:
+            item = Gtk.RadioMenuItem(label=label, group=group)
+            group = group or item
+            if current_weeks == weeks:
+                item.set_active(True)
+            item.connect("toggled", self._on_logging_menu, weeks)
+            logging_menu.append(item)
+        logging_item.set_submenu(logging_menu)
+        menu.append(logging_item)
+
+        fav = Gtk.CheckMenuItem(label="Favorites only")
+        fav.set_active(self.favorites_only)
+        fav.connect("toggled", self._on_favorites_menu)
+        menu.append(fav)
+
+        filter_active = (self.country != "All" or self.favorites_only
+                         or int(self.model.prefs.get("maxLogWeeks", -1) or -1) >= 0)
+        if filter_active:
+            menu.append(Gtk.SeparatorMenuItem())
+            clear = Gtk.MenuItem(label="Clear Filters")
+            clear.connect("activate", self._on_clear_filters)
+            menu.append(clear)
+
+        menu.show_all()
+        self.filter_button.set_popup(menu)
+        self._filter_menu = menu
+
+    def _on_country_menu(self, item: Gtk.RadioMenuItem, value: str) -> None:
+        if not item.get_active():
+            return
+        self.country = value
+        self._diff_rows()
+        self._update_status()
+
+    def _on_logging_menu(self, item: Gtk.RadioMenuItem, weeks: int) -> None:
+        if not item.get_active():
+            return
+        self.model.prefs.set("maxLogWeeks", weeks)
+        self._diff_rows()
+        self._update_status()
+
+    def _on_favorites_menu(self, item: Gtk.CheckMenuItem) -> None:
+        self.favorites_only = item.get_active()
+        self._diff_rows()
+        self._update_status()
+
+    def _on_clear_filters(self, _item) -> None:
+        self.country = "All"
+        self.favorites_only = False
+        self.model.prefs.set("maxLogWeeks", -1)
+        self.search_entry.set_text("")
+        self._diff_rows()
+        self._update_status()
+
+    # MARK: header + connection card
 
     def _build_header(self) -> Gtk.Widget:
         box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
@@ -171,10 +306,8 @@ class ServerListWindow(Gtk.ApplicationWindow):
         box.pack_start(left, True, True, 0)
 
         self.card = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        # Fixed height: the card's text changes every second while connected, and a height
-        # change here would re-fit the window and shift the list (the macOS card is likewise
-        # a fixed-size panel).
         self.card.set_size_request(280, 104)
+        self.card.set_valign(Gtk.Align.CENTER)
         self.card.get_style_context().add_class("vg-card")
         self._card_style_class = "vg-card-gray"
         self.card_icon = Gtk.Label()
@@ -196,53 +329,6 @@ class ServerListWindow(Gtk.ApplicationWindow):
         box.pack_end(self.card, False, False, 0)
         return box
 
-    def _build_filter_bar(self) -> Gtk.Widget:
-        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        bar.set_margin_start(16)
-        bar.set_margin_end(16)
-        bar.set_margin_top(6)
-        bar.set_margin_bottom(6)
-
-        self.search_entry = Gtk.SearchEntry()
-        self.search_entry.set_placeholder_text("Search host, IP, country, operator")
-        self.search_entry.set_size_request(280, -1)
-        self.search_entry.connect("search-changed", self._on_search_changed)
-        bar.pack_start(self.search_entry, False, False, 0)
-
-        self.country_combo = Gtk.ComboBoxText()
-        self.country_combo.connect("changed", self._on_country_changed)
-        bar.pack_start(self.country_combo, False, False, 0)
-
-        self.logging_combo = Gtk.ComboBoxText()
-        for label, _weeks in LOG_CHOICES:
-            self.logging_combo.append_text(label)
-        self.logging_combo.set_active(0)
-        self.logging_combo.connect("changed", self._on_logging_changed)
-        bar.pack_start(self.logging_combo, False, False, 0)
-
-        self.fav_check = Gtk.CheckButton(label="Favorites only")
-        self.fav_check.connect("toggled", self._on_favorites_toggled)
-        bar.pack_start(self.fav_check, False, False, 0)
-
-        clear_btn = Gtk.Button(label="Clear Filters")
-        clear_btn.connect("clicked", self._on_clear_filters)
-        bar.pack_end(clear_btn, False, False, 0)
-
-        details_btn = Gtk.Button(label="Details")
-        details_btn.connect("clicked", lambda _b: self._show_details())
-        bar.pack_end(details_btn, False, False, 0)
-
-        test_btn = Gtk.Button(label="Test Connection")
-        test_btn.set_tooltip_text("Try a real VPN handshake with the listed servers and show the "
-                                  "connect time from this computer")
-        test_btn.connect("clicked", lambda _b: self.model.measure(self._visible_servers()))
-        bar.pack_end(test_btn, False, False, 0)
-
-        refresh_btn = Gtk.Button(label="Refresh List")
-        refresh_btn.connect("clicked", lambda _b: self.model.refresh())
-        bar.pack_end(refresh_btn, False, False, 0)
-        return bar
-
     def _build_table(self) -> Gtk.Widget:
         self.store = Gtk.ListStore(*STORE_TYPES)
         self.tree = Gtk.TreeView(model=self.store)
@@ -258,38 +344,42 @@ class ServerListWindow(Gtk.ApplicationWindow):
             col.set_resizable(True)
             col.set_visible(visible)
             col.set_min_width(70)
-            if display_col == C_IP:
-                col.add_attribute(cell, "markup", C_IP)
+            if display_col == C_IP or display_col == C_PROBE:
+                col.add_attribute(cell, "markup", display_col)
             else:
                 col.add_attribute(cell, "text", display_col)
-            if display_col == C_SCORE or display_col == C_PROBE:
-                cell.set_property("xalign", 0.0)
             if sort_col is not None:
                 col.set_sort_column_id(sort_col)
             self.tree.append_column(col)
         # The macOS window sorts by Total Score, newest best first.
-        self.store.set_sort_column_id(C_SCORE, Gtk.SortType.DESCENDING)
+        self.store.set_sort_column_id(S_SCORE, Gtk.SortType.DESCENDING)
         return self.tree
 
     # MARK: row values (all cell text lives in the store)
 
     def _probe_text_and_rank(self, sid: str) -> tuple[str, int]:
+        """Two lines, ALWAYS: the state never changes row height (the second line is reserved
+        even when empty), so probe results cannot shift the rows below the viewport."""
         outcome = self.model.probes.get(sid)
+        # Every state renders exactly two lines — a normal first line and a small second
+        # line (a space when there is nothing to say) — so row heights never change and
+        # probe results cannot shift the rows below the viewport.
         if outcome is None:
-            return "—", _I32_MAX - 1
+            return "—\n<small> </small>", _I32_MAX - 1
         if outcome.state == "queued":
-            return "Waiting…", _I32_MAX - 1
+            return "Waiting…\n<small> </small>", _I32_MAX - 1
         if outcome.state == "testing":
-            return "Testing…", _I32_MAX - 1
+            return "Testing…\n<small> </small>", _I32_MAX - 1
         if outcome.state == "ok":
-            # Single line: a height change in a row above the viewport would shift the
-            # visible content and read as a scroll jump.
-            return (f"✓ {outcome.connectMs} ms (hs {outcome.helloMs} ms, port {outcome.port})",
+            return (f"<span foreground='#1a7f37'>✓ {outcome.connectMs:,} ms</span>\n"
+                    f"<small><span foreground='gray'>handshake {outcome.helloMs:,} ms · "
+                    f"port {outcome.port}</span></small>",
                     outcome.connectMs)
-        return f"✗ {outcome.message}", _I32_MAX
+        return (f"<span foreground='#c01c28'>✗ {outcome.message}</span>\n"
+                f"<small> </small>", _I32_MAX)
 
     def _row_values(self, s: VPNServer) -> tuple:
-        """Values in exact store column order: display columns 0..16, then sort keys 17..25."""
+        """Values in exact store column order: display columns 0..16, then sort keys 17..26."""
         probe_text, probe_rank = self._probe_text_and_rank(s.id)
         host_escaped = GLib.markup_escape_text(s.hostName)
         return (
@@ -304,7 +394,7 @@ class ServerListWindow(Gtk.ApplicationWindow):
             ListFormat.pings(s.pingToGoogle, s.ping),
             probe_text,
             ListFormat.logging(s.logType),
-            _i32(s.score),
+            f"{s.score:,}",
             s.fqdn,
             ", ".join(str(p) for p in s.prioritized_ssl_ports),
             ListFormat.udp(s.udpPort),
@@ -322,6 +412,7 @@ class ServerListWindow(Gtk.ApplicationWindow):
             probe_rank,
             _i32(s.totalTraffic),
             _i32(s.totalUsers),
+            _i32(s.score),
         )
 
     # MARK: in-place diff update (never clears the store → scroll/selection never jump)
@@ -333,7 +424,7 @@ class ServerListWindow(Gtk.ApplicationWindow):
         try:
             self._update_card()
             self._update_status()
-            self._update_countries()
+            self._rebuild_filter_menu()
             self._diff_rows()
             self._update_connect_button()
         finally:
@@ -384,19 +475,6 @@ class ServerListWindow(Gtk.ApplicationWindow):
         max_weeks = int(self.model.prefs.get("maxLogWeeks", -1) or -1)
         f.max_log_weeks = max_weeks if max_weeks >= 0 else None
         return f.apply(self.model.servers)
-
-    def _update_countries(self) -> None:
-        countries = ["All"] + sorted({s.countryLong for s in self.model.servers})
-        if self._countries_sig == tuple(countries):
-            return
-        self._countries_sig = tuple(countries)
-        current = self.country
-        self.country_combo.handler_block_by_func(self._on_country_changed)
-        self.country_combo.remove_all()
-        for c in countries:
-            self.country_combo.append_text("All countries" if c == "All" else c)
-        self.country_combo.set_active(countries.index(current) if current in countries else 0)
-        self.country_combo.handler_unblock_by_func(self._on_country_changed)
 
     def _update_card(self) -> None:
         m = self.model
@@ -454,14 +532,15 @@ class ServerListWindow(Gtk.ApplicationWindow):
         updated = m.list_fetched_at or m.list_timestamp
         updated_text = ""
         if updated:
-            updated_text = (f" (Updated at "
-                            f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(updated))})")
+            updated_text = (" (Updated at "
+                            + time.strftime("%b %d, %Y at %-I:%M %p", time.localtime(updated))
+                            + ")")
         shown = "" if len(visible) == len(m.servers) else f" — showing {len(visible)}"
         text = f"{len(m.servers)} Public VPN Relay Servers on the Earth!{updated_text}{shown}"
         if stale:
             self.status_label.set_markup(
                 f"<span foreground='orange'>{GLib.markup_escape_text(text)}  ·  "
-                f"The list is old — press Refresh List.</span>")
+                f'The list is old — press Refresh List.</span>')
         else:
             self.status_label.set_markup(f"<span foreground='gray'>"
                                          f"{GLib.markup_escape_text(text)}</span>")
@@ -502,30 +581,10 @@ class ServerListWindow(Gtk.ApplicationWindow):
         self._diff_rows()
         self._update_status()
 
-    def _on_country_changed(self, combo) -> None:
-        text = combo.get_active_text()
-        self.country = "All" if (text is None or text == "All countries") else text
-        self._diff_rows()
-        self._update_status()
-
-    def _on_logging_changed(self, combo) -> None:
-        idx = combo.get_active()
-        if 0 <= idx < len(LOG_CHOICES):
-            self.model.prefs.set("maxLogWeeks", LOG_CHOICES[idx][1])
-        self._diff_rows()
-        self._update_status()
-
-    def _on_favorites_toggled(self, check) -> None:
-        self.favorites_only = check.get_active()
-        self._diff_rows()
-        self._update_status()
-
     def _on_clear_filters(self, _btn) -> None:
         self.country = "All"
         self.favorites_only = False
-        self.fav_check.set_active(False)
         self.model.prefs.set("maxLogWeeks", -1)
-        self.logging_combo.set_active(0)
         self.search_entry.set_text("")
         self._diff_rows()
         self._update_status()

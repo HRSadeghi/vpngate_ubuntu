@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import gi
 gi.require_version("Gtk", "3.0")
-from gi.repository import Gtk  # noqa: E402
+from gi.repository import GLib, Gtk  # noqa: E402
 
 from ...core.routing import RoutingAction, RoutingConfig, RoutingRule, RoutingRuleType
 
@@ -121,7 +121,14 @@ class RoutingRulesEditor(Gtk.Box):
         self.on_change = on_change
         self.parent_window = parent_window
 
-        defaults = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        defaults = Gtk.Frame()
+        defaults.get_style_context().add_class("vg-group")
+        defaults.set_shadow_type(Gtk.ShadowType.NONE)
+        defaults_inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        defaults.add(defaults_inner)
+        self.pack_start(defaults, False, False, 0)
+        defaults = defaults_inner
+        # The following pack calls now target the group's inner box.
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         row.pack_start(Gtk.Label(label="By default", xalign=0), False, False, 0)
         self.default_combo = Gtk.ComboBoxText()
@@ -201,21 +208,26 @@ class RoutingRulesEditor(Gtk.Box):
     def _rule_row(self, rule: RoutingRule) -> Gtk.ListBoxRow:
         row = Gtk.ListBoxRow()
         rule_id = rule.id
+        row.set_activatable(False)
+        row.set_selectable(False)
         row.set_data("rule-id", rule_id)
-        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8, margin_start=8,
-                      margin_end=8, margin_top=4, margin_bottom=4)
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8, margin_start=10,
+                      margin_end=10, margin_top=8, margin_bottom=8)
         left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
         value = Gtk.Label(xalign=0)
-        value.set_markup(f"<tt>{rule.value}</tt>")
+        escaped = GLib.markup_escape_text(rule.value)
+        value.set_markup(f"<tt>{escaped}</tt>")
         left.pack_start(value, False, False, 0)
         kind = Gtk.Label(xalign=0)
         kind.get_style_context().add_class("dim-label")
         kind.set_markup(f'<small>{rule.type.label}</small>')
         left.pack_start(kind, False, False, 0)
         box.pack_start(left, True, True, 0)
+        color = ACTION_COLORS.get(rule.action, "#77767b")
         action = Gtk.Label()
-        color = ACTION_COLORS.get(rule.action, "gray")
-        action.set_markup(f'<span foreground="{color}"><b>{rule.action.label}</b></span>')
+        action.set_markup(
+            f'<span background="{color}22" foreground="{color}"><b> {rule.action.label} </b></span>')
+        action.get_style_context().add_class("vg-pill")
         box.pack_start(action, False, False, 0)
         if not rule.enabled:
             off = Gtk.Label()

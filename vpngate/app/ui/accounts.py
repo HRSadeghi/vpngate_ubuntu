@@ -111,11 +111,14 @@ class AccountEditorDialog(Gtk.Dialog):
         grid.attach(self.import_error_label, 0, row, 2, 1)
         row += 1
 
-        # Advanced options
+        # Advanced options — folded away until asked for (the macOS form's disclosure).
         row = self._heading(grid, row + 1, "Advanced Options")
         self.advanced = Gtk.Grid(column_spacing=12, row_spacing=8)
         self.advanced.set_hexpand(True)
-        grid.attach(self.advanced, 0, row, 2, 1)
+        self.advanced.set_margin_top(4)
+        adv_expander = Gtk.Expander(label="Advanced Options")
+        adv_expander.add(self.advanced)
+        grid.attach(adv_expander, 0, row, 2, 1)
         arow = 0
         max_conn = Gtk.SpinButton.new_with_range(1, 32, 1)
         max_conn.set_value(account.maxConnection if account else 1)
@@ -416,25 +419,30 @@ class AccountsWindow(Gtk.ApplicationWindow):
         toolbar.set_margin_end(12)
         toolbar.set_margin_top(8)
         toolbar.set_margin_bottom(8)
-        new_btn = Gtk.Button(label="New Setting")
-        new_btn.connect("clicked", lambda _b: self._edit(None))
-        toolbar.pack_start(new_btn, False, False, 0)
-        self.connect_btn = Gtk.Button(label="Connect")
-        self.connect_btn.connect("clicked", lambda _b: self._connect_selected())
+
+        def tool_button(label, icon, callback):
+            box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            box.pack_start(Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.BUTTON), False, False, 0)
+            box.pack_start(Gtk.Label(label=label), False, False, 0)
+            btn = Gtk.Button()
+            btn.add(box)
+            btn.connect("clicked", callback)
+            return btn
+
+        toolbar.pack_start(tool_button("New Setting", "list-add-symbolic",
+                                       lambda _b: self._edit(None)), False, False, 0)
+        toolbar.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL), False, False, 0)
+        self.connect_btn = tool_button("Connect", "system-shutdown-symbolic",
+                                       lambda _b: self._connect_selected())
         toolbar.pack_start(self.connect_btn, False, False, 0)
-        disconnect_btn = Gtk.Button(label="Disconnect")
-        disconnect_btn.connect("clicked", lambda _b: self.model.disconnect())
+        disconnect_btn = tool_button("Disconnect", "system-shutdown-symbolic",
+                                     lambda _b: self.model.disconnect())
         toolbar.pack_start(disconnect_btn, False, False, 0)
-        props_btn = Gtk.Button(label="Properties")
-        props_btn.connect("clicked", lambda _b: self._edit(self._selected()))
-        toolbar.pack_start(props_btn, False, False, 0)
-        dup_btn = Gtk.Button(label="Duplicate")
-        dup_btn.connect("clicked", lambda _b: self._duplicate())
-        toolbar.pack_start(dup_btn, False, False, 0)
-        delete_btn = Gtk.Button(label="Delete")
-        delete_btn.get_style_context().add_class("destructive-action")
-        delete_btn.connect("clicked", lambda _b: self._delete())
-        toolbar.pack_start(delete_btn, False, False, 0)
+        toolbar.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL), False, False, 0)
+        toolbar.pack_start(tool_button("Properties", "document-edit-symbolic",
+                                       lambda _b: self._edit(self._selected())), False, False, 0)
+        toolbar.pack_start(tool_button("Delete", "user-trash-symbolic",
+                                       lambda _b: self._delete()), False, False, 0)
         outer.pack_start(toolbar, False, False, 0)
         outer.pack_start(Gtk.Separator(), False, False, 0)
 
@@ -486,9 +494,20 @@ class AccountsWindow(Gtk.ApplicationWindow):
         scrolled.set_vexpand(True)
         scrolled.add(self.tree)
         outer.pack_start(scrolled, True, True, 0)
-        self.empty_label = Gtk.Label(label="No VPN connection settings yet. Add one to connect "
-                                           "to your own SoftEther VPN server.")
-        outer.pack_start(self.empty_label, False, False, 8)
+        self.empty_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        self.empty_box.set_valign(Gtk.Align.CENTER)
+        self.empty_box.set_vexpand(True)
+        empty_title = Gtk.Label()
+        empty_title.set_markup('<span foreground="gray"><b>No VPN connection settings yet</b>'
+                               '</span>')
+        empty_sub = Gtk.Label(label="Add one to connect to your own SoftEther VPN server.")
+        empty_sub.get_style_context().add_class("dim-label")
+        empty_btn = Gtk.Button(label="New Setting…")
+        empty_btn.connect("clicked", lambda _b: self._edit(None))
+        self.empty_box.pack_start(empty_title, False, False, 0)
+        self.empty_box.pack_start(empty_sub, False, False, 0)
+        self.empty_box.pack_start(empty_btn, False, False, 0)
+        outer.pack_start(self.empty_box, False, False, 8)
 
         self._sync()
         self._unsubscribe = self.manager.changed.connect(lambda: GLibIdle(self._sync))
@@ -514,7 +533,7 @@ class AccountsWindow(Gtk.ApplicationWindow):
                 status = "Offline"
             self.store.append([acc.id, acc.name, status,
                                f"{acc.host}:{acc.portList[0] if acc.portList else 443}", acc.hub])
-        self.empty_label.set_visible(not self.manager.accounts)
+        self.empty_box.set_visible(not self.manager.accounts)
         self._update_buttons()
         return False
 

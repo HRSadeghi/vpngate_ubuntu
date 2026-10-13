@@ -16,31 +16,35 @@ class HistoryWindow(Gtk.ApplicationWindow):
         super().__init__(application=app, title="Connection History", **kwargs)
         self.model = model
         self.set_default_size(760, 400)
-        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        self.add(outer)
 
-        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        head.set_margin_start(10)
-        head.set_margin_end(10)
-        head.set_margin_top(8)
-        head.set_margin_bottom(8)
+        header = Gtk.HeaderBar()
+        header.set_show_close_button(True)
+        header.set_has_subtitle(False)
         title = Gtk.Label(xalign=0)
         title.set_markup("<b>Connection history</b>")
-        head.pack_start(title, False, False, 0)
+        header.set_custom_title(title)
         clear = Gtk.Button(label="Clear")
         clear.connect("clicked", lambda _b: model.connection_log.clear())
-        head.pack_end(clear, False, False, 0)
-        outer.pack_start(head, False, False, 0)
-        outer.pack_start(Gtk.Separator(), False, False, 0)
+        header.pack_end(clear)
+        self.set_titlebar(header)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.add(outer)
 
         self.empty = Gtk.Label(label="No connections yet.")
         outer.pack_start(self.empty, True, True, 0)
 
         self.store = Gtk.ListStore(str, str, str, str, str, str)
         self.tree = Gtk.TreeView(model=self.tree_store())
+        self.tree.set_rules_hint(True)
         for title_, i in (("Server", 0), ("Address", 1), ("Connected", 2), ("Duration", 3),
                           ("Traffic", 4), ("Result", 5)):
-            col = Gtk.TreeViewColumn(title_, Gtk.CellRendererText(), text=i)
+            if i == 5:  # colored result
+                cell = Gtk.CellRendererText()
+                col = Gtk.TreeViewColumn(title_, cell)
+                col.set_cell_data_func(cell, self._result_data, None)
+            else:
+                col = Gtk.TreeViewColumn(title_, Gtk.CellRendererText(), text=i)
             col.set_resizable(True)
             self.tree.append_column(col)
         scrolled = Gtk.ScrolledWindow()
@@ -60,12 +64,19 @@ class HistoryWindow(Gtk.ApplicationWindow):
     def _on_destroy(self, *_a):
         self._unsubscribe()
 
+    def _result_data(self, _col, cell, _model, iter_, _data):
+        result = self.store[iter_][5]
+        if result and result != "ended":
+            cell.set_property("markup", f'<span foreground="#c01c28">{result}</span>')
+        else:
+            cell.set_property("markup", f'<span foreground="gray">{result or "ended"}</span>')
+
     def _reload(self) -> bool:
         self.store.clear()
         entries = self.model.connection_log.entries
         self.empty.set_visible(not entries)
         for e in entries:
-            connected = time.strftime("%Y-%m-%d %H:%M", time.localtime(e.connectedAt))
+            connected = time.strftime("%b %d at %H:%M", time.localtime(e.connectedAt))
             if e.durationSeconds is not None:
                 duration = duration_seconds(e.durationSeconds)
             else:
@@ -81,19 +92,20 @@ class LogWindow(Gtk.ApplicationWindow):
         super().__init__(application=app, title="Connection Log", **kwargs)
         self.model = model
         self.set_default_size(760, 440)
+
+        header = Gtk.HeaderBar()
+        header.set_show_close_button(True)
+        header.set_has_subtitle(False)
+        copy_btn = Gtk.Button()
+        copy_btn.set_image(Gtk.Image.new_from_icon_name(
+            "edit-copy-symbolic", Gtk.IconSize.BUTTON))
+        copy_btn.set_tooltip_text("Copy")
+        copy_btn.connect("clicked", self._copy)
+        header.pack_end(copy_btn)
+        self.set_titlebar(header)
+
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self.add(outer)
-
-        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        head.set_margin_start(10)
-        head.set_margin_end(10)
-        head.set_margin_top(8)
-        head.set_margin_bottom(8)
-        copy_btn = Gtk.Button(label="Copy")
-        copy_btn.connect("clicked", self._copy)
-        head.pack_end(copy_btn, False, False, 0)
-        outer.pack_start(head, False, False, 0)
-        outer.pack_start(Gtk.Separator(), False, False, 0)
 
         self.text = Gtk.TextView()
         self.text.set_editable(False)
@@ -130,10 +142,6 @@ class LogWindow(Gtk.ApplicationWindow):
         return False
 
     def _copy(self, _btn) -> None:
-        clipboard = Gtk.Clipboard.get_default(GdkDisplay_get_default())
+        from gi.repository import Gdk
+        clipboard = Gtk.Clipboard.get_default(Gdk.Display.get_default())
         clipboard.set_text("\n".join(self.model.log_lines), -1)
-
-
-def GdkDisplay_get_default():
-    from gi.repository import Gdk
-    return Gdk.Display.get_default()
