@@ -1,0 +1,32 @@
+# Build output
+build/
+dist/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Coverage / profiling
+*.profraw
+*.profdata
+htmlcov/
+.coverage
+
+# macOS
+.DS_Store
+._*
+
+# Editors
+.idea/
+.vscode/
+*.swp
+
+# Installers / logs
+*.deb
+*.log

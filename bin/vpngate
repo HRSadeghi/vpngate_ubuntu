@@ -1,0 +1,43 @@
+#!/usr/bin/env python3
+"""VPN Gate — GTK app (the .app equivalent)."""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def _gi_available(python: str) -> bool:
+    import subprocess
+    try:
+        probe = subprocess.run(
+            [python, "-c", "import gi; gi.require_version('Gtk', '3.0')"],
+            capture_output=True, timeout=20)
+        return probe.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def main() -> int:
+    try:
+        import gi
+        gi.require_version("Gtk", "3.0")
+    except (ImportError, ValueError):
+        # The GTK bindings ship with the system Python (/usr/bin/python3). Another
+        # interpreter first in PATH (e.g. a conda env, pyenv, a venv) does not have
+        # them: re-exec with the system one instead of failing.
+        fallback = "/usr/bin/python3"
+        if (os.path.isfile(fallback) and os.path.realpath(sys.executable) != fallback
+                and _gi_available(fallback)):
+            os.execv(fallback, [fallback, os.path.abspath(__file__), *sys.argv[1:]])
+        sys.stderr.write(
+            "VPN Gate needs GTK 3 with Python bindings. Install them with:\n"
+            "  sudo apt install python3-gi gir1.2-gtk-3.0\n")
+        return 1
+    from vpngate.app.ui.app import VPNGateApplication
+    app = VPNGateApplication()
+    return app.run(sys.argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

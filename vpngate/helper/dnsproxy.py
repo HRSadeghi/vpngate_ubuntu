@@ -1,0 +1,146 @@
+"""DNS proxy for routing-rule aware resolution (port of DNSProxy.swift).
+
+A domain explicitly marked `.direct` is asked of the physical network's own resolver (never
+the tunnel's), `.block` gets NXDOMAIN with no query sent anywhere, and everything else (the
+default, `.proxy`) goes to the tunnel's own resolver — so nothing but `.direct` domains ever
+reaches an ISP-controlled resolver. Every resolved address is also handed to NetConfig so the
+matching route exists before the answer reaches the asking app.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import socket
+
+from ..core.routing import RoutingAction, RoutingConfig, RoutingMatcher
+from . import dnsmessage
+from .netconfig import NetConfig
+
+
+class DNSUpstream:
+    """A plain UDP DNS client: one query, one answer, no retries (the asker will retry)."""
+
+    async def query(self, message: bytes, server: str, timeout_ms: int) -> bytes | None:
+        """One-shot UDP DNS exchange with `server`."""
+        loop = asyncio.get_running_loop()
+
+        class Proto(asyncio.DatagramProtocol):
+            def __init__(self) -> None:
+                self.queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=1)
+                self.transport = None
+
+            def connection_made(self, transport: asyncio.DatagramTransport) -> None:
+                self.transport = transport
+
+            def datagram_received(self, data, addr) -> None:
+                if not self.queue.full():
+                    self.queue.put_nowait(data)
+
+        try:
+            infos = await loop.getaddrinfo(server, 53, family=socket.AF_INET, type=socket.SOCK_DGRAM)
+        except Exception:
+            return None
+        if not infos:
+            return None
+        dest = infos[0][4]
+        proto = Proto()
+        try:
+            transport, _ = await loop.create_datagram_endpoint(lambda: proto, remote_addr=dest)
+        except Exception:
+            return None
+        try:
+            transport.sendto(message)
+            return await asyncio.wait_for(proto.queue.get(), timeout_ms / 1000.0)
+        except asyncio.TimeoutError:
+            return None
+        except Exception:
+            return None
+        finally:
+            try:
+                transport.close()
+            except Exception:
+                pass
+
+
+class DNSProxy:
+    class Settings:
+        def __init__(self, listen_address: str = "127.0.0.1", port: int = 53, timeout_ms: int = 4000):
+            self.listen_address = listen_address
+            self.port = port
+            self.timeout_ms = timeout_ms
+
+    def __init__(self, net: NetConfig, upstream: DNSUpstream | None = None,
+                 settings: "DNSProxy.Settings | None" = None) -> None:
+        self.net = net
+        self.upstream = upstream or DNSUpstream()
+        self.settings = settings or self.Settings()
+        self.routing = RoutingConfig()
+        self.tunnel_dns_servers: list[str] = []
+        self.direct_dns_servers: list[str] = []
+        self._transport: asyncio.DatagramTransport | None = None
+        self._running = False
+
+    @property
+    def listen_address(self) -> str:
+        return self.settings.listen_address
+
+    @property
+    def is_listening(self) -> bool:
+        return self._running
+
+    async def start(self) -> None:
+        loop = asyncio.get_running_loop()
+        proxy = self
+
+        class Proto(asyncio.DatagramProtocol):
+            def connection_made(self, transport: asyncio.DatagramTransport) -> None:
+                self.transport = transport
+
+            def datagram_received(self, data, addr) -> None:
+                loop.create_task(proxy._serve_one(data, addr))
+
+        try:
+            self._transport, _ = await loop.create_datagram_endpoint(
+                Proto, local_addr=(self.settings.listen_address, self.settings.port))
+        except OSError as e:
+            raise RuntimeError(
+                f"dns proxy bind {self.settings.listen_address}:{self.settings.port}: {e}") from None
+        self._running = True
+
+    def stop(self) -> None:
+        self._running = False
+        t = self._transport
+        self._transport = None
+        if t is not None:
+            try:
+                t.close()
+            except Exception:
+                pass
+
+    async def _serve_one(self, query: bytes, addr) -> None:
+        response = await self.handle(query)
+        if self._transport is not None:
+            self._transport.sendto(response, addr)
+
+    async def handle(self, query: bytes) -> bytes:
+        """The decision-and-forward logic for one query, with no socket involved."""
+        # A query this helper cannot even parse the name of must never be guessed at: fail closed.
+        name = dnsmessage.query_name(query)
+        if name is None:
+            return dnsmessage.servfail_response(query)
+        rule = RoutingMatcher.match_domain(name, self.routing)
+        if rule is not None and rule.action == RoutingAction.block:
+            return dnsmessage.blocked_response(query)
+        servers = self.direct_dns_servers if (rule is not None and rule.action == RoutingAction.direct) \
+            else self.tunnel_dns_servers
+        if not servers:
+            return dnsmessage.servfail_response(query)
+        response = await self.upstream.query(query, servers[0], self.settings.timeout_ms)
+        if response is None:
+            return dnsmessage.servfail_response(query)
+        # Only for an address a rule explicitly decided on — the structural routes already do
+        # the right thing for everything else.
+        if rule is not None:
+            for ip in dnsmessage.resolved_ipv4_addresses(response):
+                self.net.apply_dynamic_rule(ip=ip, action=rule.action)
+        return response

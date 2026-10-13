@@ -1,0 +1,25 @@
+#!/usr/bin/env python3
+"""vpngate-helper — privileged helper (the LaunchDaemon equivalent).
+
+The launcher works from a source tree (../../vpngate next to it) and from a system
+installation (package under <prefix>/lib/vpngate, e.g. /usr/local/lib/vpngate).
+"""
+
+import os
+import sys
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+for _candidate in (
+    os.path.dirname(_HERE),                       # source tree: <root>/bin/vpngate-helper
+    os.path.join(os.path.dirname(_HERE), "lib", "vpngate"),  # <prefix>/bin -> <prefix>/lib/vpngate
+    "/usr/local/lib/vpngate",
+    "/usr/lib/vpngate",
+):
+    if os.path.isfile(os.path.join(_candidate, "vpngate", "helper", "__main__.py")):
+        sys.path.insert(0, _candidate)
+        break
+
+from vpngate.helper.__main__ import main  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(main())

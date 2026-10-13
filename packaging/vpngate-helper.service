@@ -1,0 +1,15 @@
+[Unit]
+Description=VPN Gate privileged helper
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/vpngate-helper --daemon
+Restart=always
+RestartSec=2
+StandardOutput=append:/var/log/vpngate-helper.log
+StandardError=append:/var/log/vpngate-helper.log
+
+[Install]
+WantedBy=multi-user.target

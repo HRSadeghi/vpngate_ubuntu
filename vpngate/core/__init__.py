@@ -1,0 +1,1 @@
+"""Protocol core (port of the macOS VPNGateCore Swift module)."""
