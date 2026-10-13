@@ -466,7 +466,7 @@ class AccountsWindow(Gtk.ApplicationWindow):
         row.set_selectable(False)
         row.add(vg_box)
         row.connect("activate", lambda _r: self.app.open_main())
-        vg_row.append(row)
+        vg_row.insert(row, -1)
         outer.pack_start(vg_row, False, False, 0)
         outer.pack_start(Gtk.Separator(), False, False, 0)
 
