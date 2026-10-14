@@ -123,13 +123,40 @@ class DNSConfigurator:
             _log("[dns]", f"disabled DNS on physical link {link} (prevents leak)")
 
     def remove(self, iface: str = "") -> None:
-        if self._has_resolved() and iface:
+        if self._has_resolved():
             resolvectl = shutil.which("resolvectl")
-            self.runner.run(resolvectl, ["revert", iface])
+            # Restore the tunnel link and every link we disabled during set().
+            # Always run both — even if the set() side missed, the user must not be left
+            # with no DNS after disconnecting.
+            if iface:
+                self.runner.run(resolvectl, ["revert", iface])
             for link in self._disabled_links:
                 self.runner.run(resolvectl, ["revert", link])
+                self.runner.run(resolvectl, ["default-route", link, "yes"])
+                _log("[dns]", f"restored DNS on physical link {link}")
+            if not self._disabled_links:
+                # Even if we never recorded the disabled links, try restoring the
+                # physical interface from the current default route.
+                rc, out = self.runner.run(_ip_path(), ["route", "show", "default"])
+                if rc == 0 and "dev" in out:
+                    toks = out.split()
+                    for i, t in enumerate(toks):
+                        if t == "dev" and i + 1 < len(toks):
+                            self.runner.run(resolvectl, ["revert", toks[i + 1]])
+                            self.runner.run(resolvectl, ["default-route", toks[i + 1], "yes"])
+                            _log("[dns]", f"restored DNS on default link {toks[i + 1]}")
+                            break
+            self.runner.run(resolvectl, ["flush-caches"])
             self._disabled_links = []
             return
+        # Fallback: restore the resolv.conf we overwrote.
+        if self._wrote_resolv_conf and self._resolv_backup is not None:
+            try:
+                with open("/etc/resolv.conf", "w") as f:
+                    f.write(self._resolv_backup)
+            except OSError:
+                pass
+            self._wrote_resolv_conf = False
         if self._wrote_resolv_conf and self._resolv_backup is not None:
             try:
                 with open("/etc/resolv.conf", "w") as f:
