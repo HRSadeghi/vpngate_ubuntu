@@ -182,3 +182,74 @@ class RoutingJsonTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DNSProxyAAAABlockTests(unittest.TestCase):
+    def test_aaaa_blocked_returns_nodata_without_upstream(self):
+        import asyncio
+        from vpngate.helper.dnsproxy import DNSProxy
+        from vpngate.helper.netconfig import NetConfig
+
+        class RecordingNet(NetConfig):
+            def apply_dynamic_rule(self, ip, action):
+                pass
+
+        class NoUpstream:
+            async def query(self, message, server, timeout_ms):
+                qtype = (message[len(message) - 4] << 8) | message[len(message) - 3]
+                assert qtype == 1, "AAAA must not reach the upstream"
+                return message[:2] + b"\x81\x80" + b"\x00\x01\x00\x01\x00\x00\x00\x00" \
+                    + message[12:] + b"\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04\x09\x09\x09\x09"
+
+        async def run():
+            proxy = DNSProxy(RecordingNet(), NoUpstream(), block_ipv6=True)
+            proxy.tunnel_dns_servers = ["10.8.0.1"]
+            resp = await proxy.handle(query_bytes_aaaa("www.youtube.com"))
+            self.assertEqual(resp[3] & 0x0F, 0)          # RCODE 0 = NODATA (no error)
+            self.assertEqual((resp[6] << 8) | resp[7], 0)  # ANCOUNT 0
+            self.assertTrue(resp[2] & 0x80)              # QR set
+            resp_a = await proxy.handle(query_bytes("www.youtube.com"))
+            self.assertEqual((resp_a[6] << 8) | resp_a[7], 1)  # upstream answered, 1 record
+        asyncio.run(run())
+
+    def test_aaaa_forwarded_when_blocking_off(self):
+        import asyncio
+        from vpngate.helper.dnsproxy import DNSProxy
+        from vpngate.helper.netconfig import NetConfig
+
+        class RecordingNet(NetConfig):
+            def apply_dynamic_rule(self, ip, action):
+                pass
+
+        class CountingUpstream:
+            def __init__(self):
+                self.count = 0
+            async def query(self, message, server, timeout_ms):
+                self.count += 1
+                return message[:2] + b"\x81\x80" + b"\x00\x01\x00\x00\x00\x00\x00\x00" + message[12:]
+
+        async def run():
+            upstream = CountingUpstream()
+            proxy = DNSProxy(RecordingNet(), upstream, block_ipv6=False)
+            proxy.tunnel_dns_servers = ["10.8.0.1"]
+            await proxy.handle(query_bytes_aaaa("www.youtube.com"))
+            self.assertEqual(upstream.count, 1)  # forwarded upstream when blocking is off
+        asyncio.run(run())
+
+
+def query_bytes(name):
+    q = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+    for label in name.split("."):
+        q += bytes([len(label)]) + label.encode()
+    return q + b"\x00" + b"\x00\x01\x00\x01"
+
+
+def query_bytes_aaaa(name):
+    q = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+    for label in name.split("."):
+        q += bytes([len(label)]) + label.encode()
+    return q + b"\x00" + b"\x00\x1c\x00\x01"
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -70,11 +70,16 @@ class DNSProxy:
             self.timeout_ms = timeout_ms
 
     def __init__(self, net: NetConfig, upstream: DNSUpstream | None = None,
-                 settings: "DNSProxy.Settings | None" = None) -> None:
+                 settings: "DNSProxy.Settings | None" = None,
+                 block_ipv6: bool = False) -> None:
         self.net = net
         self.upstream = upstream or DNSUpstream()
         self.settings = settings or self.Settings()
         self.routing = RoutingConfig()
+        # When IPv6 is blocked in the tunnel, AAAA answers must NOT reach apps: they would
+        # pick v6 addresses and fail (the tunnel drops v6). Answer AAAA with NODATA so
+        # everything falls back to IPv4 — the standard "block IPv6" DNS behaviour.
+        self.block_ipv6 = block_ipv6
         self.tunnel_dns_servers: list[str] = []
         self.direct_dns_servers: list[str] = []
         self._transport: asyncio.DatagramTransport | None = None
@@ -131,6 +136,9 @@ class DNSProxy:
         rule = RoutingMatcher.match_domain(name, self.routing)
         if rule is not None and rule.action == RoutingAction.block:
             return dnsmessage.blocked_response(query)
+        if self.block_ipv6 and dnsmessage.query_type(query) == 28:  # AAAA
+            # NODATA (RCODE 0, zero answers): apps fall back to the A record.
+            return dnsmessage.noerror_nodata_response(query)
         servers = self.direct_dns_servers if (rule is not None and rule.action == RoutingAction.direct) \
             else self.tunnel_dns_servers
         if not servers:

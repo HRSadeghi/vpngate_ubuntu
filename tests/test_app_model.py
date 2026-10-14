@@ -137,8 +137,9 @@ class AppModelWiringTests(unittest.TestCase):
         did nothing (the GTK callback swallowed the NameError)."""
         model = self._model()
         sent: list = []
-        model.helper.send = sent.append  # capture instead of the socket
-        model.helper_is_running = True   # past the setup prompts
+        model.helper.send = sent.append      # capture instead of the socket
+        model.helper.connect = lambda: True  # never touch the real helper socket
+        model.helper_is_running = True       # past the setup prompts
         s = VPNServer(hostName="srv.example.com", ip="5.6.7.8", sslPorts=[443, 992], score=10)
         model.connect(s)  # disclaimer path: first call parks, agree, second sends
         model.agree_to_disclaimer()
@@ -162,6 +163,7 @@ class AppModelWiringTests(unittest.TestCase):
         model = self._model()
         sent: list = []
         model.helper.send = sent.append
+        model.helper.connect = lambda: True
         model.helper_is_running = True
         model.has_agreed_to_disclaimer = True
         first = VPNServer(hostName="dead.example.com", ip="9.9.9.9", sslPorts=[443], score=5000)
@@ -180,6 +182,7 @@ class AppModelWiringTests(unittest.TestCase):
         model = self._model()
         sent: list = []
         model.helper.send = sent.append
+        model.helper.connect = lambda: True
         model.helper_is_running = True
         model.has_agreed_to_disclaimer = True
         first = VPNServer(hostName="capped.example.com", ip="9.9.9.9", sslPorts=[443], score=5000)
@@ -202,6 +205,7 @@ class AppModelWiringTests(unittest.TestCase):
         model = self._model()
         sent: list = []
         model.helper.send = sent.append
+        model.helper.connect = lambda: True
         model.helper_is_running = True
         model.prefs.set("vgateMaxConnections", 4)
         model.has_agreed_to_disclaimer = True
