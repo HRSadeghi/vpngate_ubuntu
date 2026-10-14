@@ -306,6 +306,7 @@ class RoutingRulesEditor(Gtk.Box):
         if app in self.config.bypass_apps:
             self.config.bypass_apps.remove(app)
             self.on_change(self.config)
+            self._reload_bypass_rows()  # rebuild the rows so Remove actually removes the row
 
     def _show_running_apps_dialog(self) -> None:
         dialog = RunningAppsDialog(self.parent_window)

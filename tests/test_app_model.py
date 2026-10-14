@@ -1,5 +1,6 @@
 """App model wiring: prefs, disclaimer gate, event fan-out, favorites migration (no network)."""
 
+import asyncio
 import os
 import tempfile
 import time
@@ -200,6 +201,188 @@ class AppModelWiringTests(unittest.TestCase):
         time.sleep(0.3)  # let the app loop run the scheduled reconnect
         self.assertTrue(any(r.cmd == "disconnect" for r in sent))
         self.assertEqual(sent[-1].config.host, "8.8.8.8")
+
+    def test_remove_bypass_app_updates_ui(self):
+        """Regression: the Remove button removed from the data but never rebuilt the rows."""
+        from vpngate.app.ui.routing import RoutingRulesEditor
+        from vpngate.core.routing import RoutingConfig
+        cfg = RoutingConfig(bypass_apps_enabled=True,
+                            bypass_apps=["Telegram", "chrome"])
+        changes = []
+        editor = RoutingRulesEditor(cfg, lambda c: changes.append(c), parent_window=None)
+        editor._reload_bypass_rows()
+        rows_before = len(editor._bypass_rows_box.get_children())
+        self.assertEqual(rows_before, 2)
+        editor._remove_bypass_app("Telegram")
+        rows_after = len(editor._bypass_rows_box.get_children())
+        self.assertEqual(rows_after, 1)  # UI rebuilt — Telegram's row is gone
+        self.assertEqual(cfg.bypass_apps, ["chrome"])
+
+    def test_bypass_setup_failure_does_not_block_vpn(self):
+        """Regression: an exception in setup_app_bypass must never prevent the VPN from
+        connecting — it should log and continue without bypass."""
+        import subprocess as sp
+        import tempfile
+        from vpngate.helper.session import VPNSession, SessionTiming
+        from vpngate.core.ipcmessages import ConnectConfig, ConnectionState
+
+        # The session code wraps setup_app_bypass in try/except — verify by inspecting
+        # that _establish survives a net whose setup_app_bypass raises.
+        session = VPNSession(timing=SessionTiming())
+
+        class ExplodingNet:
+            def __init__(self):
+                self.applied = None
+                self.torn_down = False
+                self.original_route = ("192.168.1.1", "eth0")
+                self.state = None
+            def apply(self, **kw):
+                self.applied = kw
+            def setup_app_bypass(self, *args):
+                raise RuntimeError("cgroup permission denied")
+            def add_bypass(self, host):
+                pass
+            def configure_ipv6(self, a, p):
+                pass
+            def apply_dynamic_rule(self, ip, action):
+                pass
+            def direct_dns_servers(self):
+                return []
+            def teardown(self):
+                self.torn_down = True
+
+        class FakeClient:
+            def __init__(self):
+                self.closed = False
+                self.on_frame = None
+                self.on_close = None
+                self.remote_ipv4 = "203.0.113.7"
+                self.hub = None
+            def send_frame(self, frame):
+                if self.hub:
+                    self.hub.on_frame(frame)
+            async def connect(self, log):
+                class W:
+                    session_name = "SID-test"
+                    connection_name = "CN"
+                    timeout_ms = 30000
+                    session_key = b"\x01" * 20
+                    max_connection = 1
+                    use_compress = False
+                    udp_server_ip = None
+                return W()
+            @property
+            def bypass_hosts(self):
+                return [self.remote_ipv4]
+            @property
+            def bytes_in(self):
+                return 0
+            @property
+            def bytes_out(self):
+                return 0
+            def close(self, error=None):
+                self.closed = True
+                if self.on_close:
+                    cb, self.on_close = self.on_close, None
+                    cb(error)
+
+        class FakeDNSProxy:
+            def __init__(self, *a, **kw):
+                self.routing = None
+                self.tunnel_dnsservers = []
+                self.direct_dnsservers = []
+                self.listen_address = "127.0.0.1"
+                self.block_ipv6 = kw.get("block_ipv6", False)
+            async def start(self):
+                pass
+            def stop(self):
+                pass
+            def rescan_loop(self, interval=3):
+                async def _loop():
+                    pass
+                return _loop()
+
+        class FakeHub:
+            """Answers DHCP like the real hub (the bridge needs a lease to reach connected)."""
+            def __init__(self, client):
+                self.client = client
+                self.lease_ip = 0x0A080002
+            def on_frame(self, frame):
+                from vpngate.core.packets import (DHCPMessage, DHCPType, Ethernet, IPv4,
+                                                   UDP, broadcastMAC, rd16, rd32)
+                if len(frame) < 14 or rd16(frame, 12) != 0x0800:
+                    return
+                ip = IPv4.parse(frame[14:])
+                if ip is None or ip[0] != 17:
+                    return
+                udp = UDP.parse(ip[3])
+                if udp is None or udp[1] != 67:
+                    return
+                raw = bytearray(udp[2])
+                if len(raw) < 240 or raw[0] != 2:
+                    raw[0] = 2
+                msg = DHCPMessage.parse(bytes(raw))
+                if msg is None:
+                    return
+                reply = DHCPMessage(DHCPType.ack if msg.type == DHCPType.request
+                                    else DHCPType.offer, msg.xid,
+                                    b"\x5e\x00\x99\x88\x77\x66")
+                reply.yiaddr = self.lease_ip
+                reply.serverID = 0x0A080001
+                reply.router = 0x0A080001
+                reply.subnetMask = 0xFFFFFF00
+                reply.dns = [0x08080808]
+                reply.leaseSeconds = 3600
+                rraw = bytearray(reply.encode())
+                rraw[0] = 2
+                rraw[16:20] = self.lease_ip.to_bytes(4, "big")
+                udp_out = UDP.datagram(src=0, dst=0xFFFFFFFF, sport=67, dport=68,
+                                        payload=bytes(rraw))
+                ip_out = IPv4.packet(proto=17, src=0, dst=0xFFFFFFFF, payload=udp_out)
+                self.client.on_frame(Ethernet.frame(
+                    dst=broadcastMAC, src=b"\x5e\x00\x99\x88\x77\x66",
+                    ethertype=0x0800, payload=ip_out))
+
+        class FakeTun:
+            def __init__(self):
+                self.name = "faketun0"
+                self.on_packet = None
+                self.closed = False
+            def start_reading(self):
+                pass
+            def write(self, p):
+                pass
+            def close(self):
+                self.closed = True
+
+        async def scenario():
+            hub = FakeHub(None)
+            client = FakeClient()
+            client.hub = hub
+            hub.client = client
+            net = ExplodingNet()
+            session._make_transport = lambda cfg, port: client
+            session._make_tun = lambda: FakeTun()
+            session._make_net = lambda: net
+            # Avoid binding to the real port 53 (the helper owns it)
+            import vpngate.helper.session as sess_mod
+            orig_dns = sess_mod.DNSProxy
+            sess_mod.DNSProxy = FakeDNSProxy
+            try:
+                session.connect_config(ConnectConfig(
+                    host="test.example.com", ports=[443], hubName="VPNGATE",
+                    userName="vpn", authType="anonymous",
+                    maxConnection=1, disableQoS=True, autoReconnect=False, blockIPv6=True))
+                for _ in range(300):
+                    if session.snapshot.state == ConnectionState.connected:
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertEqual(session.snapshot.state, ConnectionState.connected,
+                                 "VPN must connect even when bypass setup explodes")
+            finally:
+                sess_mod.DNSProxy = orig_dns
+
+        asyncio.run(scenario())
 
     def test_max_connection_preference_is_applied(self):
         model = self._model()

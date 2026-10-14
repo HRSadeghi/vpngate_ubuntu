@@ -369,7 +369,11 @@ class VPNSession:
                   block_ipv6=config.blockIPv6, mtu_override=config.mtu,
                   routing=routing,
                   dns_proxy_address=dns_proxy.listen_address if dns_proxy else None)
-        net.setup_app_bypass(routing, net.original_route)
+        try:
+            net.setup_app_bypass(routing, net.original_route)
+        except Exception as e:
+            from .logutil import log
+            log("[bypass]", f"setup failed (VPN continues without bypass): {e}")
         if dns_proxy is not None:
             dns_proxy.tunnel_dns_servers = [ip_string(d) for d in lease.dns]
             dns_proxy.direct_dns_servers = net.direct_dns_servers()
