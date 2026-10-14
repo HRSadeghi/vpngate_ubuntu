@@ -65,6 +65,7 @@ class DNSConfigurator:
         self.runner = runner or CommandRunner()
         self._resolv_backup: str | None = None
         self._wrote_resolv_conf = False
+        self._disabled_links: list[str] = []
 
     @staticmethod
     def _has_resolved() -> bool:
@@ -78,8 +79,11 @@ class DNSConfigurator:
             r = self.runner.run(resolvectl, ["domain", iface, "~."])
             ok2 = r[0] == 0
             self.runner.run(resolvectl, ["default-route", iface, "yes"])
-            # Flush cached (possibly censored/poisoned) answers gathered while the tunnel was
-            # down — otherwise every lookup keeps returning the stale poisoned IP for hours.
+            # Disable DNS on every OTHER link so resolved cannot merge poisoned/censored
+            # answers from the physical network with the tunnel's answers. Without this,
+            # resolved queries both links and the browser gets a union of real + poisoned
+            # records (the AAAA leak that made YouTube unreachable).
+            self._disable_other_links(iface, resolvectl)
             self.runner.run(resolvectl, ["flush-caches"])
             ok = ok1 and ok2
             if not ok:
@@ -98,10 +102,33 @@ class DNSConfigurator:
             _log("[dns]", f"writing /etc/resolv.conf failed: {e}")
             return False
 
+    def _disable_other_links(self, tunnel_iface: str, resolvectl: str) -> None:
+        """Clear DNS on every non-tunnel link so resolved cannot merge poisoned answers."""
+        self._disabled_links = []
+        rc, out = self.runner.run(resolvectl, ["status"])
+        if rc != 0:
+            return
+        current_link = ""
+        for line in out.splitlines():
+            t = line.strip()
+            if t.startswith("Link "):
+                # "Link 2 (ens33):" → "ens33"
+                name = t.split("(", 1)[1].split(")", 1)[0] if "(" in t else ""
+                current_link = name
+            elif t.startswith("DNS Servers:") and current_link and current_link != tunnel_iface:
+                self._disabled_links.append(current_link)
+        for link in self._disabled_links:
+            self.runner.run(resolvectl, ["dns", link])  # clear DNS servers on that link
+            self.runner.run(resolvectl, ["default-route", link, "no"])
+            _log("[dns]", f"disabled DNS on physical link {link} (prevents leak)")
+
     def remove(self, iface: str = "") -> None:
         if self._has_resolved() and iface:
             resolvectl = shutil.which("resolvectl")
             self.runner.run(resolvectl, ["revert", iface])
+            for link in self._disabled_links:
+                self.runner.run(resolvectl, ["revert", link])
+            self._disabled_links = []
             return
         if self._wrote_resolv_conf and self._resolv_backup is not None:
             try:

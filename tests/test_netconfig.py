@@ -32,6 +32,14 @@ class RecordingRunner:
             return 1, ""
         if any(f in key for f in self.fail):
             return 1, "failed"
+        if "status" in args:  # fake resolvectl status: tun0 + ens33 with DNS
+            return 0, ("Global:\n  DNS Servers: 192.168.247.2\n\n"
+                        "Link 2 (ens33):\n"
+                        "  Current Scopes: DNS\n"
+                        "  DNS Servers: 192.168.247.2\n\n"
+                        "Link 18 (tun0):\n"
+                        "  Current Scopes: DNS\n"
+                        "  DNS Servers: 127.0.0.1\n")
         if args[:2] == ["route", "show"] or "route" in args[:2]:
             if "default" in args:
                 return 0, "default via 192.168.1.1 dev eth0 proto dhcp metric 600\n"
@@ -215,6 +223,29 @@ class NetConfigTests(unittest.TestCase):
         for path, args in runner.calls:
             if "resolvectl" in args:
                 self.fail(f"resolvectl must not be invoked via {path}: {args}")
+
+    def test_dns_link_isolation(self):
+        """resolved must not merge poisoned answers from the physical link with the tunnel's.
+        When tunnel DNS is published, DNS on every other link is disabled (and restored on
+        teardown)."""
+        dns = RecordingDNS(self.runner)
+        net = NetConfig(runner=self.runner, dns=dns, state_file=self.state_file)
+        net.cgroup_root = "/tmp/opencode-test-cgroup"  # bypass no-op
+        net.apply(iface="tun0", lease=FakeLease(), bypass_host="5.6.7.8")
+        # The RecordingDNS._disable_other_links was called via set() — but RecordingDNS
+        # overrides set(); use a real DNSConfigurator instead:
+        dns2 = DNSConfigurator(self.runner)
+        dns2.set(["8.8.8.8"], "tun0", "10.0.0.2", "10.0.0.1")
+        text = self._argv_text()
+        # tun0 DNS published
+        self.assertIn("dns tun0 8.8.8.8", text)
+        # non-tunnel links must be disabled (status shows ens33 has DNS 192.168.247.2)
+        self.assertIn("dns ens33", text)  # cleared (no servers)
+        self.assertIn("default-route ens33 no", text)
+        # teardown restores them
+        dns2.remove("tun0")
+        text = self._argv_text()
+        self.assertIn("revert ens33", text)
 
     def test_app_bypass_commands_and_cleanup(self):
         import tempfile
