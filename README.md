@@ -210,6 +210,18 @@ decompiled/        reverse-engineering notes (Ghidra pseudocode + VPNGate.dat de
                    used to understand the protocol — not part of the build
 ```
 
+## Troubleshooting
+
+See [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) for diagnosis of every common
+problem (DNS leaks, speed drops, relay stalls, browser issues, disconnect cleanup).
+
+Quick tools:
+```sh
+scripts/check-tunnel.sh    # full diagnostics while connected
+scripts/check-latency.sh   # tunnel vs direct latency
+scripts/restore-dns.sh     # restore internet after a bad disconnect
+```
+
 ## Notes / Security
 - If the helper crashes, stale routes/DNS are cleaned on its next start (only routes it added —
   state is persisted in `/var/run/vpngate-helper.state`).

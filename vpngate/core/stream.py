@@ -229,6 +229,14 @@ class TLSStream(ByteStream):
         # in a Nagle delay during heavy transfers, and dead peers must surface via keep-alives.
         raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         raw.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        # Large buffers for high-latency links: at 200ms RTT (Iran→Japan), the default
+        # 16KB wmem/rcvbuf limits throughput to ~0.6 Mbps. 512KB allows ~20 Mbps.
+        # These are the socket-level limits; the kernel auto-tunes up to tcp_rmem/wmem max.
+        try:
+            raw.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 512 * 1024)
+            raw.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 512 * 1024)
+        except OSError:
+            pass
         # ACK small writes immediately on our side as well (Linux resets QUICKACK after a
         # while, but it shortens the worst stalls right after the handshake).
         try:
