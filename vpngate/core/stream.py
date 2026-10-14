@@ -237,6 +237,15 @@ class TLSStream(ByteStream):
             raw.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 512 * 1024)
         except OSError:
             pass
+        # BBR congestion control: dramatically better than CUBIC on high-latency links
+        # (Iran→Japan 200ms RTT). BBR models the bottleneck bandwidth and minimises
+        # bufferbloat — throughput stays high even when the link is lossy.
+        # Falls back silently if the kernel lacks CONFIG_TCP_CONG_BBR.
+        try:
+            TCP_CONGESTION = 13  # socket.IPPROTO_TCP level option
+            raw.setsockopt(socket.IPPROTO_TCP, TCP_CONGESTION, b"bbr")
+        except OSError:
+            pass
         # ACK small writes immediately on our side as well (Linux resets QUICKACK after a
         # while, but it shortens the worst stalls right after the handshake).
         try:

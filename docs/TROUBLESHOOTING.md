@@ -73,6 +73,16 @@ scripts/restore-dns.sh     # if internet breaks after disconnecting
 **Cause**: Volatile relays (volunteers), or ISP blocking relay IPs.
 **Fix**: `Refresh List` → `Test Connection` → pick green ones.
 
+## Speed Optimisations (automatic in code)
+
+| Optimisation | Effect |
+|-------------|--------|
+| `TCP_NODELAY` | Small ACK frames sent immediately (no Nagle delay) |
+| `SO_SNDBUF` / `SO_RCVBUF` = 512KB | At 200ms RTT, default 16KB limits to ~0.6 Mbps; 512KB allows ~20 Mbps |
+| **BBR congestion control** | Dramatically better than CUBIC on high-latency links (200ms Iran→Japan); stays fast under packet loss |
+| UDP acceleration | When usable (10s stable inbound), data rides UDP (lower latency) |
+| TCP connections = 3–4 | Parallel TCP streams defeat per-connection throttling; set in Settings → Advanced |
+
 ## Settings Reference
 
 | Setting | Default | Purpose |
