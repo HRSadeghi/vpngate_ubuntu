@@ -23,6 +23,9 @@ def main() -> int:
         import gi
         gi.require_version("Gtk", "3.0")
     except (ImportError, ValueError):
+        if getattr(sys, "frozen", False):
+            sys.stderr.write("VPN Gate: bundled GTK failed to load.\n")
+            return 1
         # The GTK bindings ship with the system Python (/usr/bin/python3). Another
         # interpreter first in PATH (e.g. a conda env, pyenv, a venv) does not have
         # them: re-exec with the system one instead of failing.
