@@ -247,11 +247,12 @@ class NetConfig:
 
     def _add_rule_route(self, value: str, action: RoutingAction, iface: str, gw: str,
                         orig: tuple[str | None, str] | None) -> None:
-        """Adds an explicit route for one IP/CIDR routing rule."""
+        """Adds an explicit route for one IP/CIDR routing rule. Uses `replace` so a
+        route left by a previous session is overwritten instead of failing with "File exists"."""
         is_v6 = ":" in value
         prefix = "-6" if is_v6 else "-4"
         target = value if "/" in value else value + ("/128" if is_v6 else "/32")
-        args = [prefix, "route", "add", target]
+        args = [prefix, "route", "replace", target]
         undo = ["route", "del", target]
         if action == RoutingAction.direct:
             if orig is None:

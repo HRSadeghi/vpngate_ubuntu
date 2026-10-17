@@ -134,7 +134,7 @@ class NetConfigTests(unittest.TestCase):
     def test_direct_default_action_does_not_capture(self):
         cfg = RoutingConfig(default_action=RoutingAction.direct)
         self._apply(routing=cfg)
-        self.assertNotIn("route add 0.0.0.0/1 via 10.0.0.1", self._argv_text())
+        self.assertNotIn("0.0.0.0/1 via 10.0.0.1", self._argv_text())
 
     def test_proxy_rule_gets_tunnel_route(self):
         # With .direct default nothing is captured; an explicit .proxy rule routes back in.
@@ -143,15 +143,15 @@ class NetConfigTests(unittest.TestCase):
                                                action=RoutingAction.proxy)])
         self._apply(routing=cfg)
         text = self._argv_text()
-        self.assertIn("route add 203.0.113.0/24 dev vpngate0", text)
-        self.assertNotIn("route add 0.0.0.0/1 via 10.0.0.1", text)
+        self.assertIn("route replace 203.0.113.0/24 dev vpngate0", text)
+        self.assertNotIn("0.0.0.0/1 via 10.0.0.1", text)
 
     def test_direct_rule_uses_original_gateway(self):
         # With full capture, a .direct rule carves an exception via the original gateway.
         cfg = RoutingConfig(rules=[RoutingRule(type=RoutingRuleType.cidr, value="8.8.8.0/24",
                                                action=RoutingAction.direct)])
         self._apply(routing=cfg)
-        self.assertIn("route add 8.8.8.0/24 via 192.168.1.1", self._argv_text())
+        self.assertIn("route replace 8.8.8.0/24 via 192.168.1.1", self._argv_text())
 
     def test_block_rule_is_blackhole(self):
         cfg = RoutingConfig(rules=[RoutingRule(type=RoutingRuleType.cidr, value="10.9.9.0/24",
@@ -204,7 +204,7 @@ class NetConfigTests(unittest.TestCase):
     def test_dynamic_rule_route(self):
         self._apply()
         self.net.apply_dynamic_rule("203.0.113.5", RoutingAction.proxy)
-        self.assertIn("route add 203.0.113.5/32 dev vpngate0", self._argv_text())
+        self.assertIn("route replace 203.0.113.5/32 dev vpngate0", self._argv_text())
 
     def test_dns_publish_invokes_resolvectl_binary(self):
         # Regression: the publish used to run "ip resolvectl ..." (iproute2 has no such
