@@ -30,3 +30,6 @@ htmlcov/
 # Installers / logs
 *.deb
 *.log
+
+# PyInstaller generated specs (build-standalone.sh uses CLI flags)
+*.spec
