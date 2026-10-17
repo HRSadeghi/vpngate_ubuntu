@@ -44,13 +44,34 @@ class RecordingNet:
         self.original_route = ("192.168.1.1", "eth0")
         self.state = None  # no app-bypass follow-up task in the fake
         self.bypass_setup = None
+        self.captured = False
+        self.fail_opened = False
+        self.probe_hosts: list[str] = []
 
     def setup_app_bypass(self, routing, orig) -> None:
         self.bypass_setup = (routing, orig)
 
     def apply(self, iface, lease, bypass_host, block_ipv6=True, mtu_override=None,
-              routing=None, dns_proxy_address=None) -> None:
+              routing=None, dns_proxy_address=None, capture=True) -> None:
         self.applied = (iface, lease, bypass_host)
+        self.captured = capture
+
+    def enable_capture(self) -> None:
+        self.captured = True
+
+    def fail_open(self) -> None:
+        self.fail_opened = True
+        self.captured = False
+
+    def fail_close(self) -> None:
+        self.fail_opened = False
+        self.captured = True
+
+    def add_probe_host(self, host: str) -> None:
+        self.probe_hosts.append(host)
+
+    def remove_probe_host(self, host: str) -> None:
+        self.probe_hosts = [h for h in self.probe_hosts if h != host]
 
     def add_bypass(self, host: str) -> None:
         self.bypasses.append(host)
@@ -156,6 +177,15 @@ class FakeClient:
             cb(error)
 
 
+async def fake_alive(net, captured=True) -> bool:
+    """Unit tests must never open real sockets for the tunnel liveness probe."""
+    return True
+
+
+async def fake_dead(net, captured=True) -> bool:
+    return False
+
+
 class SessionTests(unittest.TestCase):
     def _config(self, **kwargs) -> ConnectConfig:
         defaults = dict(host="vpn.example.com", ports=[443], hubName="VPNGATE", userName="vpn",
@@ -183,6 +213,7 @@ class SessionTests(unittest.TestCase):
             tun = FakeTun()
             session._make_tun = lambda: tun  # type: ignore
             session._make_net = lambda: net  # type: ignore
+            session._tunnel_alive = fake_alive  # type: ignore
 
             session.connect_config(self._config())
             # Wait until connected.
@@ -194,6 +225,7 @@ class SessionTests(unittest.TestCase):
             self.assertEqual(session.snapshot.virtualIP, ip_string(hub.lease_ip))
             self.assertEqual(tun.name, "faketun0")
             self.assertEqual(net.applied[2], client.remote_ipv4)
+            self.assertTrue(net.captured)  # capture only after the tunnel proved alive
             self.assertTrue(any(e.state == ConnectionState.connected for e in events))
 
             session.disconnect()
@@ -207,6 +239,86 @@ class SessionTests(unittest.TestCase):
             self.assertTrue(tun.closed)
         self._run(scenario())
 
+    def test_dead_relay_never_captures_the_machine(self):
+        """Regression: a relay that accepts the session but sends nothing used to install
+        the default routes and blackhole the whole machine. The probe must refuse to
+        capture and report the failure so the app picks another relay."""
+        async def scenario():
+            session = VPNSession(timing=SessionTiming())
+            events: list[HelperEvent] = []
+            session.emit = events.append
+
+            hub = FakeHub(None)
+            client = FakeClient(hub)
+            hub.client = client
+            net = RecordingNet()
+
+            session._make_transport = lambda config, port: client
+            session._make_tun = lambda: FakeTun()  # type: ignore
+            session._make_net = lambda: net  # type: ignore
+            session._tunnel_alive = fake_dead  # type: ignore
+
+            session.connect_config(self._config())
+            for _ in range(300):
+                if any(e.error for e in events) or session.snapshot.error:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertFalse(net.captured, "a dead relay must never get the capture routes")
+            self.assertTrue(any(e.error and "not carrying" in e.error for e in events)
+                            or "not carrying" in (session.snapshot.error or ""),
+                            f"probe failure must be reported: {events} {session.snapshot}")
+            session.disconnect()
+        self._run(scenario())
+
+    def test_dns_proxy_runs_for_block_ipv6_without_domain_rules(self):
+        """Regression: AAAA answers leaked into apps whenever no domain rule was set —
+        the proxy that swallows AAAA was only created for domain rules, and was never
+        told blockIPv6 either, so every app tried the blocked v6 first and hung."""
+        async def scenario():
+            session = VPNSession(timing=SessionTiming())
+            session.emit = lambda e: None
+            hub = FakeHub(None)
+            client = FakeClient(hub)
+            hub.client = client
+            net = RecordingNet()
+            made: list[dict] = []
+
+            class SpyProxy:
+                def __init__(self, net, *a, **kw):
+                    made.append(kw)
+                    self.routing = None
+                    self.tunnel_dns_servers: list[str] = []
+                    self.direct_dns_servers: list[str] = []
+                    self.listen_address = "127.0.0.1"
+                    self.block_ipv6 = kw.get("block_ipv6", False)
+
+                async def start(self):
+                    pass
+
+                def stop(self):
+                    pass
+
+            import vpngate.helper.session as sess_mod
+            orig = sess_mod.DNSProxy
+            sess_mod.DNSProxy = SpyProxy
+            try:
+                session._make_transport = lambda config, port: client
+                session._make_tun = lambda: FakeTun()  # type: ignore
+                session._make_net = lambda: net  # type: ignore
+                session._tunnel_alive = fake_alive  # type: ignore
+                session.connect_config(self._config(blockIPv6=True))  # no routing rules
+                for _ in range(300):
+                    if session.snapshot.state == ConnectionState.connected:
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertEqual(session.snapshot.state, ConnectionState.connected)
+                self.assertTrue(made, "blockIPv6 needs the DNS proxy even without domain rules")
+                self.assertTrue(made[0].get("block_ipv6"), "the proxy must know v6 is blocked")
+            finally:
+                sess_mod.DNSProxy = orig
+            session.disconnect()
+        self._run(scenario())
+
     def test_close_reason_is_reported(self):
         async def scenario():
             from vpngate.core.stream import closed_error
@@ -217,6 +329,7 @@ class SessionTests(unittest.TestCase):
             session._make_transport = lambda config, port: client
             session._make_tun = lambda: FakeTun()
             session._make_net = lambda: RecordingNet()
+            session._tunnel_alive = fake_alive  # type: ignore
             session.connect_config(self._config())
             for _ in range(300):
                 if session.snapshot.state == ConnectionState.connected:

@@ -99,6 +99,51 @@ class NetConfigTests(unittest.TestCase):
     def _argv_text(self) -> str:
         return "\n".join(self._argvs())
 
+    def test_capture_deferred_until_enable_capture(self):
+        # A relay that accepts the session but carries no data must never take the
+        # machine's default routes: apply(capture=False) leaves them alone until the
+        # tunnel proves it works.
+        self._apply(capture=False)
+        text = self._argv_text()
+        self.assertNotIn("0.0.0.0/1", text)
+        self.assertNotIn("128.0.0.0/1", text)
+        self.assertNotIn("::/1", text)
+        self.net.enable_capture()
+        text = self._argv_text()
+        self.assertIn("route replace 0.0.0.0/1 via 10.0.0.1", text)
+        self.assertIn("route replace 128.0.0.0/1 via 10.0.0.1", text)
+        self.assertIn("-6 route replace ::/1 dev vpngate0", text)
+
+    def test_fail_open_removes_capture_and_fail_close_restores(self):
+        self._apply()
+        before = len(self._argvs())
+        self.net.fail_open()
+        text = "\n".join(self._argvs()[before:])
+        self.assertIn("route del 0.0.0.0/1", text)
+        self.assertIn("route del 128.0.0.0/1", text)
+        self.assertIn("route del ::/1", text)
+        self.assertIn("route del 8000::/1", text)
+        # The capture routes are gone from the undo list: teardown must not chase them.
+        self.assertFalse(any(u[1:3] == ["del", "0.0.0.0/1"]
+                             for u in (self.net.state.added_routes or [])))
+        self.assertFalse(self.net._capture_enabled)
+        before = len(self._argvs())
+        self.net.fail_close()
+        text = "\n".join(self._argvs()[before:])
+        self.assertIn("route replace 0.0.0.0/1 via 10.0.0.1", text)
+        self.assertTrue(self.net._capture_enabled)
+
+    def test_probe_host_routes_are_transient(self):
+        self._apply(capture=False)
+        before = len(self._argvs())
+        self.net.add_probe_host("1.1.1.1")
+        self.net.remove_probe_host("1.1.1.1")
+        text = "\n".join(self._argvs()[before:])
+        self.assertIn("route replace 1.1.1.1/32 dev vpngate0", text)
+        self.assertIn("route del 1.1.1.1/32", text)
+        self.assertFalse(any("1.1.1.1" in " ".join(u)
+                             for u in (self.net.state.added_routes or [])))
+
     def test_apply_adds_address_mtu_and_routes(self):
         self._apply()
         text = self._argv_text()

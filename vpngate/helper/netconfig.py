@@ -69,7 +69,16 @@ class DNSConfigurator:
 
     @staticmethod
     def _has_resolved() -> bool:
-        return bool(shutil.which("resolvectl")) and os.path.isdir("/run/systemd/resolve")
+        if not (shutil.which("resolvectl") and os.path.isdir("/run/systemd/resolve")):
+            return False
+        # Only trust resolvectl when the system actually uses systemd-resolved: with a
+        # static /etc/resolv.conf, per-link DNS configures nothing apps ever ask. In that
+        # case fall through to the plain resolv.conf rewrite.
+        try:
+            target = os.path.realpath("/etc/resolv.conf")
+        except OSError:
+            return False
+        return target.startswith("/run/systemd/resolve/")
 
     def set(self, servers: list[str], iface: str, address: str, router: str) -> bool:
         if self._has_resolved():
@@ -223,6 +232,11 @@ class NetConfig:
         self.routing = RoutingConfig()
         self.tunnel_gateway: str | None = None
         self.captured_physical_dns: list[str] = []
+        # Capture bookkeeping (fail-open support): the publish arguments for the resolver,
+        # the undo lists of the default-capture routes, and whether capture is installed.
+        self._publish: tuple[list[str], str, str, str] | None = None
+        self._capture_undo: list[list[str]] = []
+        self._capture_enabled = False
 
     # MARK: routes
 
@@ -271,8 +285,12 @@ class NetConfig:
 
     def apply(self, iface: str, lease, bypass_host: str, block_ipv6: bool = True,
               mtu_override: int | None = None, routing: RoutingConfig | None = None,
-              dns_proxy_address: str | None = None) -> None:
-        """`lease` is the bridge's Lease (ip/mask/router/dns/seconds/mtu as ints)."""
+              dns_proxy_address: str | None = None, capture: bool = True) -> None:
+        """`lease` is the bridge's Lease (ip/mask/router/dns/seconds/mtu as ints).
+
+        `capture=False` defers the default-capture routes and the resolver publish to
+        enable_capture(): a relay must prove it carries traffic before the machine's
+        default routes are taken over."""
         from ..core.packets import ip_string
         ip = ip_string(lease.ip)
         gw = ip_string(lease.router)
@@ -307,15 +325,9 @@ class NetConfig:
                 if rule.enabled and not rule.type.is_domain and rule.action != RoutingAction.direct:
                     self._add_rule_route(rule.value, rule.action, iface, gw, orig)
         else:
-            self._add_route(["route", "replace", "0.0.0.0/1", "via", gw], ["route", "del", "0.0.0.0/1"])
-            self._add_route(["route", "replace", "128.0.0.0/1", "via", gw], ["route", "del", "128.0.0.0/1"])
             for rule in self.routing.effective_rules:
                 if rule.enabled and not rule.type.is_domain and rule.action != RoutingAction.proxy:
                     self._add_rule_route(rule.value, rule.action, iface, gw, orig)
-
-        # Both halves of the IPv6 space point at the tunnel either way, so native IPv6 never leaks.
-        self._add_route(["-6", "route", "replace", "::/1", "dev", iface], ["-6", "route", "del", "::/1"])
-        self._add_route(["-6", "route", "replace", "8000::/1", "dev", iface], ["-6", "route", "del", "8000::/1"])
 
         # ALWAYS capture the physical DNS before the resolver is switched over — a `.direct`
         # domain rule added later (live-apply) needs these to resolve through the physical
@@ -329,12 +341,77 @@ class NetConfig:
 
         if lease.dns:
             published = [dns_proxy_address] if dns_proxy_address else [ip_string(d) for d in lease.dns]
-            if self.dns.set(published, iface, ip, gw):
-                self.state.dns_set = True
-                self._save()
+            self._publish = (published, iface, ip, gw)
+        self._capture_enabled = False
+        self._capture_undo = []
+        if capture:
+            self.enable_capture()
 
     def direct_dns_servers(self) -> list[str]:
         return self.captured_physical_dns
+
+    # MARK: capture / fail-open
+
+    def enable_capture(self) -> None:
+        """Installs the default-capture routes and publishes the tunnel's resolver. Called
+        once the tunnel has proved it carries traffic — and again after a fail-open."""
+        if self.state is None or self._capture_enabled or self.tunnel_gateway is None:
+            return
+        iface, gw = self.state.iface, self.tunnel_gateway
+        before = len(self.state.added_routes or [])
+        if self.routing.default_action != RoutingAction.direct:
+            self._add_route(["route", "replace", "0.0.0.0/1", "via", gw], ["route", "del", "0.0.0.0/1"])
+            self._add_route(["route", "replace", "128.0.0.0/1", "via", gw], ["route", "del", "128.0.0.0/1"])
+        # Both halves of the IPv6 space point at the tunnel either way, so native v6 never leaks.
+        self._add_route(["-6", "route", "replace", "::/1", "dev", iface], ["-6", "route", "del", "::/1"])
+        self._add_route(["-6", "route", "replace", "8000::/1", "dev", iface], ["-6", "route", "del", "8000::/1"])
+        added = (self.state.added_routes or [])[before:]
+        self._capture_undo = [list(u) for u in added]
+        if self._publish is not None:
+            published, p_iface, ip, p_gw = self._publish
+            if self.dns.set(published, p_iface, ip, p_gw):
+                self.state.dns_set = True
+                self._save()
+        self._capture_enabled = True
+
+    def fail_open(self) -> None:
+        """The relay stopped carrying traffic: stop blackholing the machine. The default
+        routes are removed and DNS goes back to the physical network while the session
+        stays up — traffic fails open to the real network instead of dying behind a dead
+        tunnel. enable_capture() puts the capture back if the tunnel recovers."""
+        if self.state is None or not self._capture_enabled:
+            return
+        if self.state.dns_set:
+            self.dns.remove(self.state.iface)
+            self.state.dns_set = False
+        for undo in self._capture_undo:
+            self.runner.run(_ip_path(), undo)
+        if self.state.added_routes is not None:
+            drop = {tuple(u) for u in self._capture_undo}
+            self.state.added_routes = [u for u in self.state.added_routes
+                                       if tuple(u) not in drop]
+        self._capture_undo = []
+        self._capture_enabled = False
+        self._save()
+        _log("[route]", "fail-open: capture routes removed, traffic goes direct "
+                        "(the relay is not carrying data)")
+
+    def fail_close(self) -> None:
+        """Traffic is flowing again after a fail-open: re-capture the default routes."""
+        self.enable_capture()
+
+    def add_probe_host(self, host: str) -> None:
+        """Routes one probe target into the tunnel temporarily (pre-capture liveness
+        check). Not recorded in the state file: the kernel drops the route with the
+        device when the tunnel goes away."""
+        if self.state is None or not validation.is_ipv4_literal(host):
+            return
+        self.runner.run(_ip_path(), ["route", "replace", host + "/32", "dev", self.state.iface])
+
+    def remove_probe_host(self, host: str) -> None:
+        if self.state is None:
+            return
+        self.runner.run(_ip_path(), ["route", "del", host + "/32"])
 
     def apply_dynamic_rule(self, ip: str, action: RoutingAction) -> None:
         """Routes one resolved address (from the DNS proxy) the way a domain rule asked for."""
@@ -370,6 +447,9 @@ class NetConfig:
         self.tunnel_gateway = None
         self.captured_physical_dns = []
         self.routing = RoutingConfig()
+        self._publish = None
+        self._capture_undo = []
+        self._capture_enabled = False
         try:
             os.remove(self.state_file)
         except OSError:

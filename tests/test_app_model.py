@@ -240,6 +240,16 @@ class AppModelWiringTests(unittest.TestCase):
                 self.applied = kw
             def setup_app_bypass(self, *args):
                 raise RuntimeError("cgroup permission denied")
+            def enable_capture(self):
+                pass
+            def fail_open(self):
+                pass
+            def fail_close(self):
+                pass
+            def add_probe_host(self, host):
+                pass
+            def remove_probe_host(self, host):
+                pass
             def add_bypass(self, host):
                 pass
             def configure_ipv6(self, a, p):
@@ -364,6 +374,10 @@ class AppModelWiringTests(unittest.TestCase):
             session._make_transport = lambda cfg, port: client
             session._make_tun = lambda: FakeTun()
             session._make_net = lambda: net
+
+            async def fake_alive(net, captured=True):
+                return True
+            session._tunnel_alive = fake_alive
             # Avoid binding to the real port 53 (the helper owns it)
             import vpngate.helper.session as sess_mod
             orig_dns = sess_mod.DNSProxy

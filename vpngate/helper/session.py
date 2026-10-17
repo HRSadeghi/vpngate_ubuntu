@@ -68,6 +68,7 @@ class VPNSession:
         # Seams for tests (the Swift SessionDependencies): overridden in tests to inject doubles.
         self._make_tun = lambda: TunDevice()
         self._make_net = lambda: NetConfig()
+        self._tunnel_alive = self._default_tunnel_alive
 
     @property
     def snapshot(self) -> HelperEvent:
@@ -379,20 +380,28 @@ class VPNSession:
             primary_bypass = config.host
         else:
             primary_bypass = client.remote_ipv4 or config.host
-        # Domain rules need a resolver of our own: IP/CIDR rules alone are handled by routes.
+        # Domain rules need a resolver of our own: IP/CIDR rules alone are handled by
+        # routes. blockIPv6 needs one too — without the proxy nothing swallows AAAA answers
+        # and every app tries the blocked v6 first and hangs.
         routing = routing_config_from_json(config.routing)
-        needs_dns_proxy = any(rule.enabled and rule.type.is_domain
-                              for rule in routing.effective_rules)
+        needs_dns_proxy = config.blockIPv6 or any(rule.enabled and rule.type.is_domain
+                                                 for rule in routing.effective_rules)
         dns_proxy: DNSProxy | None = None
         if needs_dns_proxy:
-            dns_proxy = DNSProxy(net)
-            dns_proxy.routing = routing
-            await dns_proxy.start()
-            r.dns_proxy = dns_proxy
+            try:
+                dns_proxy = DNSProxy(net, block_ipv6=config.blockIPv6)
+                dns_proxy.routing = routing
+                await dns_proxy.start()
+                r.dns_proxy = dns_proxy
+            except Exception as e:
+                from .logutil import log
+                log("[dns]", f"proxy start failed (using the tunnel's resolver directly): {e}")
+                dns_proxy = None
         net.apply(iface=tun.name, lease=lease, bypass_host=primary_bypass,
                   block_ipv6=config.blockIPv6, mtu_override=config.mtu,
                   routing=routing,
-                  dns_proxy_address=dns_proxy.listen_address if dns_proxy else None)
+                  dns_proxy_address=dns_proxy.listen_address if dns_proxy else None,
+                  capture=False)
         try:
             net.setup_app_bypass(routing, net.original_route)
         except Exception as e:
@@ -414,45 +423,79 @@ class VPNSession:
             bridge.start_ipv6(on_v6_address)
         tun.start_reading()
 
+        # A relay that accepts the session but carries no data must never blackhole the
+        # machine: prove the tunnel works BEFORE the default routes are captured. The
+        # probe is a TCP handshake through the tunnel — without it the dead relay would
+        # take the whole box offline (and every reconnect attempt would too).
+        if not await self._tunnel_alive(net, captured=False):
+            raise RuntimeError("the relay accepted the session but is not carrying any "
+                               "traffic (connection test failed)")
+        net.enable_capture()
+
         self._set(gen, ConnectionState.connected, ip=ip_string(lease.ip),
                   log=f"Connected via {tun.name}, gateway {ip_string(lease.router)}")
 
-        self._stall_base_in = None
-
         async def counter():
-            # 1 s events for the UI, 5 s throughput lines for the log file, and a stall
-            # detector: when the relay stops sending data entirely (capped session), say so
-            # in plain words instead of leaving the user with a silent dead connection.
+            # 1 s events for the UI, 5 s throughput lines for the log file, and a liveness
+            # watchdog: when the relay stops carrying traffic the capture routes are pulled
+            # (fail-open) so the machine keeps working while another relay is picked.
+            from .logutil import log
             last_sample = (client.bytes_in, client.bytes_out)
             since_sample = time.monotonic()
-            last_nonzero_in = time.monotonic()
+            last_in = client.bytes_in
+            last_progress = time.monotonic()
+            fail_opened = False
             stall_warned = False
+            probing = False
+            misses = 0
+            last_probe = 0.0
             while True:
                 await asyncio.sleep(1)
                 if not self._is_current(gen):
                     return
-                if client.bytes_in > 0:
-                    if stall_warned and client.bytes_in > self._stall_base_in:
-                        stall_warned = False  # data is flowing again
-                    if client.bytes_in > 0 and self._stall_base_in is None:
-                        self._stall_base_in = 0
-                if client.bytes_in > self._stall_base_in:
-                    last_nonzero_in = time.monotonic()
-                    self._stall_base_in = client.bytes_in
-                    stall_warned = False
-                elif not stall_warned and client.bytes_in > 0 \
-                        and time.monotonic() - last_nonzero_in >= 60:
-                    # Data flowed once and then stopped: the relay is capping this session.
-                    stall_warned = True
-                    log("[session]", "the relay has sent no data for 60 s — it is likely "
-                                     "throttling/capping this session; reconnect or switch "
-                                     "to another server")
-                    self._current.log = ("The relay stopped sending data (it may be capping "
-                                         "this session). Reconnect or pick another server.")
-                    self._current.helperVersion = HELPER_VERSION
-                    if self.emit is not None:
-                        self.emit(self._current)
-                    self._current.log = None
+                now = time.monotonic()
+                if client.bytes_in > last_in:
+                    last_in = client.bytes_in
+                    last_progress = now
+                    misses = 0
+                    if fail_opened:
+                        fail_opened = False
+                        stall_warned = False
+                        try:
+                            net.fail_close()
+                            log("[route]", "traffic is flowing again — capture routes restored")
+                        except Exception as e:
+                            log("[route]", f"recapture failed: {e}")
+                elif not probing and now - last_progress >= 10 and now - last_probe >= 5:
+                    # Quiet does not mean dead (an idle tunnel is healthy): ask the tunnel
+                    # directly. Two misses in a row mean the relay is gone or capping.
+                    probing = True
+                    last_probe = now
+                    try:
+                        alive = await self._tunnel_alive(net, captured=True)
+                    finally:
+                        probing = False
+                    if alive:
+                        last_progress = time.monotonic()
+                        misses = 0
+                    else:
+                        misses += 1
+                        if misses >= 2 and not fail_opened:
+                            fail_opened = True
+                            stall_warned = True
+                            try:
+                                net.fail_open()
+                            except Exception as e:
+                                log("[route]", f"fail-open failed: {e}")
+                            log("[session]", "the relay is not carrying data — traffic is "
+                                             "going direct while another server is picked")
+                            self._current.log = ("The relay stopped sending data (it may be "
+                                                 "capping this session). Reconnect or pick "
+                                                 "another server.")
+                            self._current.helperVersion = HELPER_VERSION
+                            if self.emit is not None:
+                                self.emit(self._current)
+                            self._current.log = None
                 self._current.bytesIn = client.bytes_in
                 self._current.bytesOut = client.bytes_out
                 self._current.log = None
@@ -468,7 +511,6 @@ class VPNSession:
                     last_sample = (client.bytes_in, client.bytes_out)
                     since_sample = now
                     st = client.stats()
-                    from .logutil import log
                     log("[throughput]",
                         f"in={d_in * 8 / 5 / 1e6:.2f}Mbps out={d_out * 8 / 5 / 1e6:.2f}Mbps "
                         f"totals in={st['in']} out={st['out']} "
@@ -488,6 +530,32 @@ class VPNSession:
         r.renew_task = loop.create_task(renew())
         if net.state is not None and net.state.app_bypass:
             r.bypass_task = loop.create_task(net.rescan_loop())
+
+    async def _default_tunnel_alive(self, net, captured: bool) -> bool:
+        """True when a TCP handshake through the tunnel completes. Before capture
+        (`captured=False`) temporary host routes push the probe into the tunnel; after
+        capture the default routes already do. Any one target answering is enough."""
+        targets = (("1.1.1.1", 443), ("8.8.8.8", 443), ("9.9.9.9", 443))
+        if not captured:
+            for host, _port in targets:
+                net.add_probe_host(host)
+        try:
+            async def one(host: str, port: int) -> bool:
+                try:
+                    _reader, writer = await asyncio.wait_for(
+                        asyncio.open_connection(host, port), 3.0)
+                    try:
+                        writer.close()
+                    except Exception:
+                        pass
+                    return True
+                except Exception:
+                    return False
+            return any(await asyncio.gather(*[one(h, p) for h, p in targets]))
+        finally:
+            if not captured:
+                for host, _port in targets:
+                    net.remove_probe_host(host)
 
     def _release(self, r: Resources) -> None:
         """Stops traffic first, then removes routes, then closes the tun. Safe more than once."""
