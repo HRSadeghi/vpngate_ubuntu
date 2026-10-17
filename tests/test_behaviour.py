@@ -180,6 +180,20 @@ class DNSProxyTests(unittest.TestCase):
                 proxy.stop()
         asyncio.run(run())
 
+    def test_loopback_upstream_fails_closed(self):
+        """Regression: a captured loopback (the resolved stub) as 'physical DNS' looped
+        queries forever and hung the whole system resolver. Fail closed instead."""
+        async def run():
+            proxy = DNSProxy(RecordingNet(), FakeDNSServer())
+            proxy.routing = self._config(rules=[
+                RoutingRule(type=RoutingRuleType.domainSuffix, value="example.com",
+                            action=RoutingAction.direct)])
+            proxy.tunnel_dns_servers = ["10.8.0.1"]
+            proxy.direct_dns_servers = ["127.0.0.53"]
+            resp = await proxy.handle(query_bytes("www.example.com"))
+            self.assertEqual(resp[3] & 0xF, 2)  # SERVFAIL, never a loop
+        asyncio.run(run())
+
     def test_nodata_keeps_edns_opt(self):
         """Regression: a synthesized NODATA without OPT made systemd-resolved mark the
         server non-EDNS and retry over TCP forever (resolution hung completely)."""

@@ -69,7 +69,7 @@ class AllowDNSConfigurator(DNSConfigurator):
     def set(self, servers, iface, address, router):
         return True
 
-    def remove(self, iface=""):
+    def remove(self, iface="", restore=None):
         pass
 
     def current_servers(self):
@@ -132,6 +132,51 @@ class NetConfigTests(unittest.TestCase):
         text = "\n".join(self._argvs()[before:])
         self.assertIn("route replace 0.0.0.0/1 via 10.0.0.1", text)
         self.assertTrue(self.net._capture_enabled)
+
+    def test_never_captures_loopback_as_physical_dns(self):
+        """Regression: with the physical link's DNS already cleared, current_servers() fell
+        back to /etc/resolv.conf and captured the resolved STUB (127.0.0.53) as the
+        'physical DNS' — direct-rule lookups then looped proxy -> stub -> proxy and wedged
+        the whole system resolver."""
+        import io
+        from unittest import mock
+        dns = DNSConfigurator(self.runner)
+        dns._has_resolved = staticmethod(lambda: False)  # force the resolv.conf path
+        fake = io.StringIO("nameserver 127.0.0.53\nnameserver 192.168.1.1\n")
+        real_open = open
+
+        def fake_open(path, *a, **kw):
+            if str(path) == "/etc/resolv.conf":
+                return fake
+            return real_open(path, *a, **kw)
+
+        with mock.patch("builtins.open", side_effect=fake_open):
+            self.assertEqual(dns.current_servers(), ["192.168.1.1"])
+        self.net.captured_physical_dns = ["127.0.0.53", "192.168.1.1"]
+        self.assertEqual(self.net.direct_dns_servers(), ["192.168.1.1"],
+                         "loopback must never be offered as the physical resolver")
+
+    def test_disabled_link_dns_restored_explicitly(self):
+        """Regression: `revert` alone left the machine with NO resolvers when the manager
+        did not re-publish; the captured servers must be set back explicitly."""
+        class StatusRunner(RecordingRunner):
+            def run(self, path, args):
+                if "status" in args:
+                    self.calls.append((path, tuple(args)))
+                    return 0, ("Link 2 (ens33):\n  DNS Servers: 192.168.247.2\n"
+                               "Link 18 (tun0):\n  DNS Servers: 127.0.0.1\n")
+                return super().run(path, args)
+
+        r2 = StatusRunner()
+        dns2 = DNSConfigurator(r2)
+        dns2._has_resolved = staticmethod(lambda: True)
+        dns2.set(["127.0.0.1"], "tun0", "10.0.0.2", "10.0.0.1")
+        self.assertEqual(dns2._disabled_links, ["ens33"])
+        self.assertEqual(dns2._disabled_servers, {"ens33": ["192.168.247.2"]})
+        r2.calls.clear()
+        dns2.remove("tun0", restore=[{"link": "ens33", "servers": ["192.168.247.2"]}])
+        text = "\n".join(" ".join(a) for _p, a in r2.calls)
+        self.assertIn("dns ens33 192.168.247.2", text)
 
     def test_probe_host_routes_are_transient(self):
         self._apply(capture=False)

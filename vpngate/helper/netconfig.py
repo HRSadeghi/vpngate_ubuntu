@@ -47,6 +47,9 @@ class State:
     # Fallback DNS rewrite support (no systemd-resolved): the original resolv.conf text.
     resolv_conf_backup: str | None = None
     tun_iface: str = ""
+    # Links whose DNS we cleared ({"link": ..., "servers": [...]}) — kept in the state file
+    # so even a crash (or a hung systemd-resolved at restore time) can be repaired later.
+    disabled_dns: list | None = None
 
 
 class CommandRunner:
@@ -66,6 +69,7 @@ class DNSConfigurator:
         self._resolv_backup: str | None = None
         self._wrote_resolv_conf = False
         self._disabled_links: list[str] = []
+        self._disabled_servers: dict[str, list[str]] = {}
 
     @staticmethod
     def _has_resolved() -> bool:
@@ -112,38 +116,64 @@ class DNSConfigurator:
             return False
 
     def _disable_other_links(self, tunnel_iface: str, resolvectl: str) -> None:
-        """Clear DNS on every non-tunnel link so resolved cannot merge poisoned answers."""
+        """Clear DNS on every non-tunnel link so resolved cannot merge poisoned answers.
+        The original servers are remembered: `revert` alone does not always bring them
+        back (and left the machine with NO resolvers when it failed)."""
         self._disabled_links = []
+        self._disabled_servers = {}
         rc, out = self.runner.run(resolvectl, ["status"])
         if rc != 0:
             return
         current_link = ""
+        link_servers: list[str] = []
+
+        def flush():
+            if current_link and current_link != tunnel_iface and link_servers:
+                self._disabled_links.append(current_link)
+                self._disabled_servers[current_link] = list(link_servers)
+
         for line in out.splitlines():
             t = line.strip()
-            if t.startswith("Link "):
+            if t.startswith("Link ") and "(" in t:
+                flush()
                 # "Link 2 (ens33):" → "ens33"
-                name = t.split("(", 1)[1].split(")", 1)[0] if "(" in t else ""
-                current_link = name
-            elif t.startswith("DNS Servers:") and current_link and current_link != tunnel_iface:
-                self._disabled_links.append(current_link)
+                current_link = t.split("(", 1)[1].split(")", 1)[0]
+                link_servers = []
+            elif t.startswith("DNS Servers:") or t.startswith("Current DNS Server:"):
+                for tok in t.split(":", 1)[1].split():
+                    tok = tok.strip(",()")
+                    if validation.is_ipv4_literal(tok) and not validation.is_local_address(tok):
+                        if tok not in link_servers:
+                            link_servers.append(tok)
+        flush()
         for link in self._disabled_links:
             self.runner.run(resolvectl, ["dns", link])  # clear DNS servers on that link
             self.runner.run(resolvectl, ["default-route", link, "no"])
             _log("[dns]", f"disabled DNS on physical link {link} (prevents leak)")
 
-    def remove(self, iface: str = "") -> None:
+    def remove(self, iface: str = "", restore: list | None = None) -> None:
         if self._has_resolved():
             resolvectl = shutil.which("resolvectl")
             # Restore the tunnel link and every link we disabled during set().
-            # Always run both — even if the set() side missed, the user must not be left
-            # with no DNS after disconnecting.
+            # `restore` covers links disabled by a previous run (from the state file).
             if iface:
                 self.runner.run(resolvectl, ["revert", iface])
-            for link in self._disabled_links:
+            items: dict[str, list[str]] = dict(self._disabled_servers)
+            for entry in (restore or []):
+                try:
+                    items.setdefault(entry["link"], list(entry.get("servers") or []))
+                except (TypeError, KeyError):
+                    continue
+            for link, servers in items.items():
                 self.runner.run(resolvectl, ["revert", link])
                 self.runner.run(resolvectl, ["default-route", link, "yes"])
-                _log("[dns]", f"restored DNS on physical link {link}")
-            if not self._disabled_links:
+                if servers:
+                    # revert alone is not enough when the manager does not re-publish the
+                    # DNS (or resolved was busy): set the captured servers explicitly, or
+                    # the machine is left with no resolvers at all.
+                    self.runner.run(resolvectl, ["dns", link, *servers])
+                _log("[dns]", f"restored DNS on physical link {link} ({', '.join(servers) or 'revert'})")
+            if not items:
                 # Even if we never recorded the disabled links, try restoring the
                 # physical interface from the current default route.
                 rc, out = self.runner.run(_ip_path(), ["route", "show", "default"])
@@ -157,6 +187,7 @@ class DNSConfigurator:
                             break
             self.runner.run(resolvectl, ["flush-caches"])
             self._disabled_links = []
+            self._disabled_servers = {}
             return
         # Fallback: restore the resolv.conf we overwrote.
         if self._wrote_resolv_conf and self._resolv_backup is not None:
@@ -203,7 +234,10 @@ class DNSConfigurator:
                         t = line.strip()
                         if t.startswith("nameserver "):
                             server = t.split()[1]
-                            if validation.is_ipv4_literal(server):
+                            # Loopback here is the resolved stub (127.0.0.53) or our own
+                            # proxy — asking it for "the physical DNS" would loop forever.
+                            if validation.is_ipv4_literal(server) \
+                                    and not validation.is_local_address(server):
                                 out.append(server)
             except OSError:
                 pass
@@ -348,7 +382,8 @@ class NetConfig:
             self.enable_capture()
 
     def direct_dns_servers(self) -> list[str]:
-        return self.captured_physical_dns
+        # Fail closed rather than loop: 127.x here is the stub or our own proxy.
+        return [s for s in self.captured_physical_dns if not validation.is_local_address(s)]
 
     # MARK: capture / fail-open
 
@@ -371,6 +406,9 @@ class NetConfig:
             published, p_iface, ip, p_gw = self._publish
             if self.dns.set(published, p_iface, ip, p_gw):
                 self.state.dns_set = True
+                self.state.disabled_dns = [
+                    {"link": link, "servers": self.dns._disabled_servers.get(link, [])}
+                    for link in self.dns._disabled_links]
                 self._save()
         self._capture_enabled = True
 
@@ -506,7 +544,7 @@ class NetConfig:
             if not validation.is_local_address(st.bypass_host):
                 runner.run(_ip_path(), ["route", "del", st.bypass_host + "/32"])
         if st.dns_set:
-            dns.remove(st.tun_iface or st.iface)
+            dns.remove(st.tun_iface or st.iface, restore=st.disabled_dns)
 
     def _save(self) -> None:
         if self.state is None:
@@ -518,6 +556,7 @@ class NetConfig:
                     "bypass_host": self.state.bypass_host,
                     "gateway": self.state.gateway,
                     "dns_set": self.state.dns_set,
+                    "disabled_dns": self.state.disabled_dns,
                     "added_routes": self.state.added_routes,
                     "resolv_conf_backup": self.state.resolv_conf_backup,
                     "tun_iface": self.state.tun_iface,

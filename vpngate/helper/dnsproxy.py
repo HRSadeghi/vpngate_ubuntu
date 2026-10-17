@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import socket
 
+from ..core import validation
 from ..core.routing import RoutingAction, RoutingConfig, RoutingMatcher
 from . import dnsmessage
 from .netconfig import NetConfig
@@ -181,6 +182,10 @@ class DNSProxy:
         servers = self.direct_dns_servers if (rule is not None and rule.action == RoutingAction.direct) \
             else self.tunnel_dns_servers
         if not servers:
+            return dnsmessage.servfail_response(query)
+        if validation.is_local_address(servers[0]):
+            # Loopback is the systemd-resolved stub or this proxy itself: asking it would
+            # loop the query forever and wedge the whole system resolver. Fail closed.
             return dnsmessage.servfail_response(query)
         qtype = dnsmessage.query_type(query)
         # Some upstream resolvers answer DO=1 (EDNS DNSSEC) queries with an empty section;
