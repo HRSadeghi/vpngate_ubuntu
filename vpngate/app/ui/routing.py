@@ -326,9 +326,14 @@ class RoutingRulesEditor(Gtk.Box):
             self.hint.set_text("Everything goes through the tunnel except what the rules below "
                                "send elsewhere.")
         else:
+            extra = ""
+            if not any(r.enabled and r.action == RoutingAction.proxy for r in self.config.rules):
+                extra = (" ⚠ With no Proxy rule below, NOTHING uses the VPN — sites resolve "
+                         "through the tunnel's DNS but connect outside it. For one exception, "
+                         "keep the default on Proxy and add that site as a Direct rule.")
             self.hint.set_text("Everything bypasses the tunnel except what the rules below send "
                                "into it. IPv6 keeps being captured and dropped regardless (see "
-                               "“Block IPv6” in General).")
+                               "“Block IPv6” in General)." + extra)
 
     def _rule_row(self, rule: RoutingRule) -> Gtk.ListBoxRow:
         row = Gtk.ListBoxRow()
