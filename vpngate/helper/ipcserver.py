@@ -129,6 +129,8 @@ class IPCServer:
         elif request.cmd == "setBypassApps":
             apps = [a.strip()[:256] for a in (request.bypassApps or []) if a.strip()][:64]
             self.session.set_bypass_apps(apps, bool(request.bypassAppsEnabled))
+        elif request.cmd == "setRouting":
+            self.session.set_routing_live(request.routing)
         else:
             self._send(client, self.session.snapshot)
 

@@ -384,6 +384,31 @@ class AppModelWiringTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_routing_live_apply_pushes_to_helper(self):
+        """Regression: routing rules must take effect immediately (no reconnect)."""
+        model = self._model()
+        sent: list = []
+        model.helper.send = sent.append
+        model.helper.connect = lambda: True
+        model.helper_is_running = True
+        model.has_agreed_to_disclaimer = True
+        # simulate connected state
+        from vpngate.core.ipcmessages import ConnectionState, HelperEvent
+        model._handle_event(HelperEvent(ConnectionState.connected, server="1.2.3.4",
+                                        virtualIP="10.0.0.2", bytesIn=1, bytesOut=1))
+        from vpngate.core.routing import RoutingConfig, RoutingRule, RoutingRuleType, RoutingAction
+        cfg = RoutingConfig(rules=[RoutingRule(
+            type=RoutingRuleType.domainSuffix, value="example.com",
+            action=RoutingAction.direct)])
+        model.set_routing_config(cfg)
+        # a setRouting IPC message must have been sent
+        assert any(r.cmd == "setRouting" for r in sent),             f"setRouting not sent: {[r.cmd for r in sent]}"
+        # the routing config should contain the rule
+        msg = next(r for r in sent if r.cmd == "setRouting")
+        assert msg.routing is not None
+        assert len(msg.routing.get("rules", [])) == 1
+        assert msg.routing["rules"][0]["value"] == "example.com"
+
     def test_max_connection_preference_is_applied(self):
         model = self._model()
         sent: list = []

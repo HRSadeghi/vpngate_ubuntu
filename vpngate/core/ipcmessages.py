@@ -147,6 +147,7 @@ class HelperRequest:
     config: ConnectConfig | None = None
     bypassApps: list[str] | None = None
     bypassAppsEnabled: bool | None = None
+    routing: dict | None = None
 
     def to_json(self) -> dict:
         d: dict = {"cmd": self.cmd}
@@ -172,6 +173,8 @@ class HelperRequest:
             r.bypassApps = [str(a) for a in d["bypassApps"]]
         if "bypassAppsEnabled" in d and d["bypassAppsEnabled"] is not None:
             r.bypassAppsEnabled = bool(d["bypassAppsEnabled"])
+        if "routing" in d and d["routing"] is not None:
+            r.routing = d["routing"]
         if "port" in d and d["port"] is not None:
             r.port = int(d["port"])
         if "ports" in d and d["ports"] is not None:

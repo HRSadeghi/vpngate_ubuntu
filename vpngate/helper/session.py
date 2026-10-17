@@ -149,6 +149,30 @@ class VPNSession:
         )
         self.connect_config(cfg)
 
+    def set_routing_live(self, routing_json: dict | None) -> None:
+        """Live-apply routing rules while connected: update the DNS proxy's routing (domain
+        rules) and add routes for IP/CIDR rules immediately — no reconnect needed."""
+        if self._res is None:
+            return
+        from ..core.clientaccount import routing_config_from_json
+        routing = routing_config_from_json(routing_json)
+        net = self._res.net
+        dns_proxy = self._res.dns_proxy
+        try:
+            if dns_proxy is not None:
+                dns_proxy.routing = routing
+            # Apply IP/CIDR rules as routes (domain rules are handled by the DNS proxy).
+            if net is not None:
+                for rule in routing.effective_rules:
+                    if rule.enabled and not rule.type.is_domain:
+                        net.apply_dynamic_rule(rule.value, rule.action)
+            from .logutil import log
+            log("[routing]", f"live update: {len(routing.rules)} rule(s), "
+                             f"default={routing.default_action.value}")
+        except Exception as e:
+            from .logutil import log
+            log("[routing]", f"live apply failed: {e}")
+
     def set_bypass_apps(self, apps: list[str], enabled: bool) -> None:
         """Live-apply the bypass list while connected (no reconnect needed)."""
         if self._res is None or self._res.net is None:
