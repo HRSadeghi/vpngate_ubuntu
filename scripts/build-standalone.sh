@@ -9,6 +9,8 @@
 #   /usr/bin/python3 -m pip install --user pyinstaller pyinstaller-hooks-contrib
 #
 # Sizes (Ubuntu 22.04): helper ~8 MB, app ~106 MB (GTK + typelibs bundled).
+# --collect-submodules pkg_resources: Debian's pkg_resources loads its vendored
+# appdirs/packaging via a dynamic __import__, which the analyzer cannot follow.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -48,6 +50,7 @@ echo "== vpngate (GTK app) =="
     --hidden-import gi.repository.Gtk \
     --hidden-import gi.repository.Pango \
     --hidden-import gi.repository.GdkPixbuf \
+    --collect-submodules pkg_resources \
     "$ROOT/bin/vpngate"
 
 echo
