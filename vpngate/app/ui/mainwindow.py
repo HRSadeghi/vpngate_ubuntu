@@ -52,7 +52,7 @@ COLUMNS = [
     ("VPN Sessions", C_SESSIONS, S_SESSIONS, True),
     ("Line Speed", C_SPEED, S_SPEED, True),
     ("Ping (Google, SE)", C_PING, S_PING, True),
-    ("Test from this Mac", C_PROBE, S_PROBE_RANK, True),
+    ("Test from this computer", C_PROBE, S_PROBE_RANK, True),
     ("Logging Policy", C_LOGGING, C_LOGGING, True),
     ("Total Score", C_SCORE, S_SCORE, True),
     ("DDNS Hostname", C_DDNS, C_DDNS, False),
