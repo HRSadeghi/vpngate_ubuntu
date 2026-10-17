@@ -166,18 +166,26 @@ class DNSConfigurator:
             self._wrote_resolv_conf = False
 
     def current_servers(self) -> list[str]:
-        """The resolver(s) in effect right before the tunnel's are published (the physical network's own DNS)."""
+        """The resolver(s) in effect right before the tunnel's are published (the physical
+        network's own DNS). Excludes the tunnel interface and loopback addresses (127.x)."""
         out: list[str] = []
         # systemd-resolved: ask it directly for per-link DNS (skips the 127.0.0.53 stub).
         if self._has_resolved():
             rc, text = self.runner.run("resolvectl", ["status"])
             if rc == 0:
+                current_link = ""
                 for line in text.splitlines():
                     t = line.strip()
-                    if t.startswith("DNS Servers:") or t.startswith("Current DNS Server:"):
+                    if t.startswith("Link ") and "(" in t:
+                        name = t.split("(", 1)[1].split(")", 1)[0] if "(" in t else ""
+                        current_link = name
+                    elif t.startswith("DNS Servers:") or t.startswith("Current DNS Server:"):
                         for tok in t.split(":", 1)[1].split():
                             tok = tok.strip(",()")
-                            if validation.is_ipv4_literal(tok):
+                            # Skip the tunnel's own DNS and loopback addresses
+                            if current_link.startswith(("tun", "vpngate")):
+                                continue
+                            if validation.is_ipv4_literal(tok) and not validation.is_local_address(tok):
                                 out.append(tok)
         if not out:
             try:

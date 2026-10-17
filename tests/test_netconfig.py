@@ -224,6 +224,18 @@ class NetConfigTests(unittest.TestCase):
             if "resolvectl" in args:
                 self.fail(f"resolvectl must not be invoked via {path}: {args}")
 
+    def test_current_servers_excludes_tunnel_and_loopback(self):
+        """current_servers must not capture the tunnel's own DNS (127.0.0.1) or loopback —
+        the DNS proxy would query itself and get SERVFAIL for Direct domains."""
+        dns = DNSConfigurator(self.runner)
+        # Fake resolvectl status with tun0 + ens33
+        self.runner.calls.clear()
+        self.runner.fail.clear()
+        captured = dns.current_servers()
+        # ens33's 192.168.247.2 should be captured; tun0's 127.0.0.1 should NOT
+        self.assertIn("192.168.247.2", captured)
+        self.assertNotIn("127.0.0.1", captured)
+
     def test_dns_link_isolation(self):
         """resolved must not merge poisoned answers from the physical link with the tunnel's.
         When tunnel DNS is published, DNS on every other link is disabled (and restored on
