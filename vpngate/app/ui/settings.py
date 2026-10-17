@@ -369,7 +369,7 @@ class SettingsWindow(Gtk.ApplicationWindow):
         gate, grows = group("VPN Gate connections")
         spin = Gtk.SpinButton.new_with_range(1, 32, 1)
         try:
-            spin.set_value(max(1, min(int(prefs.get("vgateMaxConnections", 1) or 1), 32)))
+            spin.set_value(max(1, min(int(prefs.get("vgateMaxConnections", 4) or 4), 32)))
         except (TypeError, ValueError):
             spin.set_value(1)
         spin.connect("value-changed", lambda w: prefs.set("vgateMaxConnections",

@@ -156,7 +156,7 @@ class AppModelWiringTests(unittest.TestCase):
         self.assertTrue(cfg.disableQoS)
         self.assertFalse(cfg.autoReconnect)
         self.assertEqual(cfg.ports, [443, 992])
-        self.assertEqual(cfg.maxConnection, 1)
+        self.assertEqual(cfg.maxConnection, 4)
 
     def test_reconnect_rotates_to_next_relay(self):
         """Relays die constantly; the reconnect loop must rotate through candidates instead of

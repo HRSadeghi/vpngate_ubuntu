@@ -445,11 +445,12 @@ class AppModel:
         self._send_connect(s)
 
     def _send_connect(self, s: VPNServer) -> None:
-        # The VPN Gate client's own account: hub VPNGATE, anonymous, QoS off, one TCP
-        # connection — unless the user raised "TCP connections" (a parallel-flow defense
-        # against per-connection throttling; the server caps it in the welcome anyway).
+        # The VPN Gate client's own account: hub VPNGATE, anonymous, QoS off, and several
+        # TCP connections by default — one connection puts every inner TCP segment behind a
+        # single outer congestion window (TCP-over-TCP) and multi-packet TLS flights stall on
+        # any loss; parallel flows carry on. The server caps the number in the welcome.
         try:
-            max_conn = max(1, min(int(self.prefs.get("vgateMaxConnections", 1) or 1), 32))
+            max_conn = max(1, min(int(self.prefs.get("vgateMaxConnections", 4) or 4), 32))
         except (TypeError, ValueError):
             max_conn = 1
         cfg = ConnectConfig(

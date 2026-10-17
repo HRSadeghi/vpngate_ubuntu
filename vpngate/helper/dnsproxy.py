@@ -83,6 +83,7 @@ class DNSProxy:
         self.tunnel_dns_servers: list[str] = []
         self.direct_dns_servers: list[str] = []
         self._transport: asyncio.DatagramTransport | None = None
+        self._tcp_server: asyncio.AbstractServer | None = None
         self._running = False
 
     @property
@@ -110,6 +111,14 @@ class DNSProxy:
         except OSError as e:
             raise RuntimeError(
                 f"dns proxy bind {self.settings.listen_address}:{self.settings.port}: {e}") from None
+        # TCP is not optional for a DNS server: systemd-resolved retries over TCP whenever a
+        # UDP answer looks off (truncated, no OPT) and loops forever when nothing answers.
+        try:
+            self._tcp_server = await asyncio.start_server(
+                self._serve_tcp, self.settings.listen_address, self.settings.port)
+        except OSError as e:
+            raise RuntimeError(
+                f"dns proxy TCP bind {self.settings.listen_address}:{self.settings.port}: {e}") from None
         self._running = True
 
     def stop(self) -> None:
@@ -119,6 +128,36 @@ class DNSProxy:
         if t is not None:
             try:
                 t.close()
+            except Exception:
+                pass
+        srv = self._tcp_server
+        self._tcp_server = None
+        if srv is not None:
+            try:
+                srv.close()
+            except Exception:
+                pass
+
+    async def _serve_tcp(self, reader: asyncio.StreamReader,
+                         writer: asyncio.StreamWriter) -> None:
+        """DNS over TCP (RFC 7766): 2-byte length prefix per message."""
+        try:
+            while self._running:
+                hdr = await reader.readexactly(2)
+                n = int.from_bytes(hdr, "big")
+                if n == 0:
+                    break
+                message = await reader.readexactly(n)
+                response = await self.handle(message)
+                writer.write(len(response).to_bytes(2, "big") + response)
+                await writer.drain()
+        except (asyncio.IncompleteReadError, ConnectionError, asyncio.CancelledError):
+            pass
+        except Exception:
+            pass
+        finally:
+            try:
+                writer.close()
             except Exception:
                 pass
 
@@ -143,7 +182,20 @@ class DNSProxy:
             else self.tunnel_dns_servers
         if not servers:
             return dnsmessage.servfail_response(query)
-        response = await self.upstream.query(query, servers[0], self.settings.timeout_ms)
+        qtype = dnsmessage.query_type(query)
+        # Some upstream resolvers answer DO=1 (EDNS DNSSEC) queries with an empty section;
+        # the same question without the DO bit gets the real records. Nothing here validates
+        # DNSSEC, so the DO bit is simply not forwarded.
+        response = await self.upstream.query(dnsmessage.strip_do_bit(query),
+                                             servers[0], self.settings.timeout_ms)
+        if response is not None and not dnsmessage.resolved_ipv4_addresses(response) \
+                and qtype == 1 and dnsmessage.header(response) \
+                and dnsmessage.header(response)[0] == 0:
+            # Empty A answer: an EDNS-hostile middlebox. Retry as a plain-DNS query.
+            response2 = await self.upstream.query(dnsmessage.strip_edns(query),
+                                                  servers[0], self.settings.timeout_ms)
+            if response2 is not None:
+                response = response2
         if response is None:
             return dnsmessage.servfail_response(query)
         # Only for an address a rule explicitly decided on — the structural routes already do

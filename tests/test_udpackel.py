@@ -1,8 +1,8 @@
-"""UDP acceleration: one-way-broken paths must fall back to TCP (download-stall fix).
+"""UDP acceleration: the data plane must be proven before it carries data.
 
-A NAT can deliver the server's datagrams to us while our outbound datagrams never reach it.
-The peer's echo of OUR tick (your_tick) is the only proof our sends arrive; when that echo
-lags our last send, is_usable must go False so frames ride TCP again, and recover afterwards.
+Keep-alives are tiny and routinely pass where large data datagrams are dropped (DPI/MTU);
+a "stable receive period" of control packets proves nothing. Acceleration starts only
+after real data has arrived over UDP, and one-way-broken paths fall back to TCP.
 """
 
 import unittest
@@ -22,12 +22,13 @@ def make_accel(clock):
 
 
 def stabilise(accel, clock, server_key, echo_tick_source):
-    """Client sends a keep-alive, then the peer sends 12 s of echoing keep-alives."""
+    """Client sends a keep-alive, then the peer sends 12 s of echoing keep-alives — the
+    first of which carries a real data payload (the data-plane proof)."""
     accel._send_packet(compressed=False, payload=b"", max_size=1000)
-    for _ in range(12):
+    for i in range(12):
         packet, _ = encode(server_key, bytes(range(12)), cookie=0x11111111,
                            my_tick=clock(), your_tick=echo_tick_source(),
-                           compressed=False, payload=b"")
+                           compressed=False, payload=b"data" if i == 0 else b"")
         accel.handle_datagram(packet, ("9.9.9.9", 5555))
         clock.advance(1000)
 
@@ -56,13 +57,33 @@ class FakeClock:
 
 
 class OneWayPathTests(unittest.TestCase):
-    def test_usable_when_echo_keeps_up(self):
+    def test_keepalives_alone_are_not_usable(self):
+        """Regression: control packets alone made the tunnel one-way (out over UDP, back
+        over TCP) while the log claimed USABLE — large data datagrams were being dropped."""
         clock = FakeClock()
         accel = make_accel(clock)
         self.assertFalse(accel.is_usable)
 
         # The peer sends keep-alives for > 10 s (stable receive), echoing OUR latest tick.
+        accel._send_packet(compressed=False, payload=b"", max_size=1000)
+        for _ in range(12):
+            packet, _ = encode(bytes(range(64, 96)), bytes(range(12)), cookie=0x11111111,
+                               my_tick=clock(), your_tick=accel.last_sent_tick,
+                               compressed=False, payload=b"")
+            accel.handle_datagram(packet, ("9.9.9.9", 5555))
+            clock.advance(1000)
+        self.assertFalse(accel.is_usable,
+                         "keep-alives alone must never enable the UDP data path")
+        self.assertEqual(accel.data_bytes_in, 0)
+
+    def test_usable_when_data_and_echo_keep_up(self):
+        clock = FakeClock()
+        accel = make_accel(clock)
+        self.assertFalse(accel.is_usable)
+
+        # The peer sends data + keep-alives for > 10 s, echoing OUR latest tick.
         stabilise(accel, clock, bytes(range(64, 96)), lambda: accel.last_sent_tick)
+        self.assertGreater(accel.data_bytes_in, 0)
         self.assertTrue(accel.is_usable)
 
     def test_one_way_broken_falls_back_to_tcp(self):
@@ -122,11 +143,12 @@ class OneWayPathTests(unittest.TestCase):
 
     def test_keepalives_alone_do_not_trip_the_guard(self):
         """During idle periods only tiny keep-alives flow; the echo naturally lags by the
-        keep-alive interval, which must not disable UDP."""
+        keep-alive interval, which must not disable UDP once the data plane is proven."""
         clock = FakeClock()
         accel = make_accel(clock)
         server_key = bytes(range(64, 96))
         stabilise(accel, clock, server_key, lambda: accel.last_sent_tick)
+        self.assertTrue(accel.is_usable)
         accel._send_packet(compressed=False, payload=b"", max_size=1000)
         self.assertTrue(accel.last_sent_tick - accel.last_recv_my_tick <= accel.ECHO_LAG_MS)
         self.assertTrue(accel.is_usable)

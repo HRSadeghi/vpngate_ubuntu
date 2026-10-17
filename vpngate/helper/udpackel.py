@@ -62,10 +62,12 @@ class UdpAccel:
         self.last_recv_my_tick = 0     # highest of our own ticks the peer echoed back
         self.last_recv_your_tick = 0   # highest peer tick seen; echoed in everything we send
         self.last_sent_tick = 0        # our own clock value used in the last datagram we sent
+        self.data_bytes_in = 0         # real data received over UDP — the data-plane proof
         self.first_stable_receive_tick = 0
         self._last_usable_logged: bool | None = None
         self._echo_lagged = False
         self._receive_gapped = False
+        self._awaiting_data = False
         self._keepalive_task: asyncio.Task | None = None
 
         self.on_frame = None
@@ -127,7 +129,8 @@ class UdpAccel:
         if usable != self._last_usable_logged:
             self._last_usable_logged = usable
             reason = ("echo lag (our datagrams are not arriving)" if self._echo_lagged
-                      else ("receive gap" if self._receive_gapped else "stable receive period"))
+                      else ("no UDP data received yet" if self._awaiting_data
+                            else ("receive gap" if self._receive_gapped else "stable receive period")))
             log("[udp]", f"acceleration {'USABLE' if usable else 'NOT usable'} ({reason})")
         return usable
 
@@ -135,6 +138,7 @@ class UdpAccel:
     def _usable_state(self) -> bool:
         self._echo_lagged = False
         self._receive_gapped = False
+        self._awaiting_data = False
         if self._is_closed or not self.configured or self.last_recv_tick == 0 \
                 or self.first_stable_receive_tick == 0:
             self._receive_gapped = True
@@ -144,6 +148,13 @@ class UdpAccel:
         if now < self.last_recv_tick or now - self.last_recv_tick > timeout:
             self.first_stable_receive_tick = 0
             self._receive_gapped = True
+            return False
+        # Keep-alives are tiny and routinely pass where large data datagrams are dropped
+        # (DPI/MTU): a "stable receive period" of control packets proved nothing about the
+        # data path and made the tunnel one-way (out over UDP, back over TCP). Only ever
+        # accelerate after real data has actually arrived over UDP.
+        if self.data_bytes_in == 0:
+            self._awaiting_data = True
             return False
         # One-way breakage: both tick values come from OUR clock, so the lag needs no skew
         # correction. While the echo lags, our data is not arriving — TCP takes over.
@@ -284,6 +295,7 @@ class UdpAccel:
         # Every non-empty payload is data; an empty one is a keep-alive. A nonzero flag means zlib.
         if not decoded.payload:
             return
+        self.data_bytes_in += len(decoded.payload)
         if self.on_byte_count:
             self.on_byte_count(len(decoded.payload), 0)
         if h.compressed:
