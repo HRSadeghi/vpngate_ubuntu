@@ -308,14 +308,15 @@ class NetConfig:
         self._add_route(["-6", "route", "replace", "::/1", "dev", iface], ["-6", "route", "del", "::/1"])
         self._add_route(["-6", "route", "replace", "8000::/1", "dev", iface], ["-6", "route", "del", "8000::/1"])
 
-        # Captured before the resolver is switched over, so a `.direct` domain rule can still be
-        # resolved by the physical network's own DNS once the DNS proxy is listening.
-        if not self.routing.is_empty:
-            self.captured_physical_dns = [s for s in self.dns.current_servers()
-                                          if validation.is_ipv4_literal(s)]
-            for server in self.captured_physical_dns:
-                if not validation.is_local_address(server) and orig:
-                    self._add_bypass_route(server, orig)
+        # ALWAYS capture the physical DNS before the resolver is switched over — a `.direct`
+        # domain rule added later (live-apply) needs these to resolve through the physical
+        # network. Previously this was gated on `routing.is_empty` which left direct_dnsservers
+        # empty when the user connected without rules and added them later.
+        self.captured_physical_dns = [s for s in self.dns.current_servers()
+                                      if validation.is_ipv4_literal(s)]
+        for server in self.captured_physical_dns:
+            if not validation.is_local_address(server) and orig:
+                self._add_bypass_route(server, orig)
 
         if lease.dns:
             published = [dns_proxy_address] if dns_proxy_address else [ip_string(d) for d in lease.dns]
