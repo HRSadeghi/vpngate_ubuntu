@@ -6,7 +6,7 @@ import webbrowser
 
 import gi
 gi.require_version("Gtk", "3.0")
-from gi.repository import Gio, Gtk  # noqa: E402
+from gi.repository import Gio, GLib, Gtk  # noqa: E402
 
 from ..model import AppModel
 from .accounts import AccountsWindow
@@ -19,6 +19,27 @@ from .tray import TrayIcon
 VPNGATE_WEBSITE = "http://www.vpngate.net/"
 
 
+def _quiet_gtk_scale_noise() -> None:
+    """Drop exactly one known-benign GTK 3 critical.
+
+    AyatanaAppIndicator asks its hidden status icon for a scale factor while GTK
+    does not consider it a widget yet ("gtk_widget_get_scale_factor: assertion
+    'GTK_IS_WIDGET (widget)' failed"). It is non-fatal and comes from inside the
+    toolkit, not from a widget of ours. Every other message still prints."""
+    def _handler(_domain: str, _level, message: str, _data) -> None:
+        if message and "gtk_widget_get_scale_factor" in message:
+            return
+        GLib.log_default_handler(_domain, _level, message, None)
+
+    try:
+        GLib.log_set_handler(
+            "Gtk",
+            GLib.LogLevelFlags.LEVEL_CRITICAL | GLib.LogLevelFlags.LEVEL_WARNING,
+            _handler, None)
+    except Exception:
+        pass  # older PyGObject: leave the noise rather than fail
+
+
 class VPNGateApplication(Gtk.Application):
     def __init__(self) -> None:
         super().__init__(application_id="com.yazdanifar.vpngate.linux",
@@ -28,6 +49,7 @@ class VPNGateApplication(Gtk.Application):
         self.tray: TrayIcon | None = None
 
     def do_startup(self) -> None:
+        _quiet_gtk_scale_noise()
         Gtk.Application.do_startup(self)
         self.model = AppModel()
         self.add_accelerator_actions()
