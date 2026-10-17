@@ -188,7 +188,7 @@ class RoutingRulesEditor(Gtk.Box):
         head_label = Gtk.Label(xalign=0)
         head_label.set_markup("<b>Rules</b>")
         self.list_box = Gtk.ListBox()
-        self.list_box.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.list_box.set_selection_mode(Gtk.SelectionMode.SINGLE)
         self.list_box.connect("row-activated", self._on_row_activated)
         rules_inner.add(self.list_box)
         add_btn = Gtk.Button(label="Add Rule…")
@@ -333,7 +333,7 @@ class RoutingRulesEditor(Gtk.Box):
     def _rule_row(self, rule: RoutingRule) -> Gtk.ListBoxRow:
         row = Gtk.ListBoxRow()
         row.set_activatable(True)
-        row.set_data("rule-id", rule.id)
+        row.rule_id = rule.id  # Python attribute (set_data is unsupported in PyGObject)
         box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8, margin_start=10,
                       margin_end=10, margin_top=8, margin_bottom=8)
         left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
@@ -371,13 +371,14 @@ class RoutingRulesEditor(Gtk.Box):
         row = self.list_box.get_selected_row()
         if row is None:
             return None
-        rule_id = row.get_data("rule-id")
+        rule_id = getattr(row, "rule_id", None)
         for r in self.config.rules:
             if r.id == rule_id:
                 return r
         return None
 
     def _add_rule(self) -> None:
+        self._editing_rule_id = None
         RoutingRuleSheet(self.parent_window, None, self._rule_added).show_all()
 
     def _rule_added(self, rule: RoutingRule | None) -> None:
@@ -388,13 +389,14 @@ class RoutingRulesEditor(Gtk.Box):
     def _edit_selected(self) -> None:
         rule = self._selected_rule()
         if rule is not None:
+            self._editing_rule_id = rule.id
             RoutingRuleSheet(self.parent_window, rule, self._rule_edited).show_all()
 
     def _rule_edited(self, updated: RoutingRule | None) -> None:
         if updated is None:
-            sel = self._selected_rule()
-            if sel is not None:
-                self.config.rules = [r for r in self.config.rules if r.id != sel.id]
+            # Delete: use the tracked editing rule (selection may have changed)
+            rid = getattr(self, "_editing_rule_id", None)
+            self.config.rules = [r for r in self.config.rules if r.id != rid]
         else:
             for i, r in enumerate(self.config.rules):
                 if r.id == updated.id:
