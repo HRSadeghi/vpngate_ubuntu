@@ -10,7 +10,7 @@ import unittest
 from vpngate.core.ipcmessages import ConnectConfig, ConnectionState, HelperEvent, ProxySettings
 from vpngate.core.packets import (DHCPMessage, DHCPType, Ethernet, IPv4, UDP, broadcastMAC,
                                   ip_string, rd16)
-from vpngate.helper.session import SessionTiming, VPNSession
+from vpngate.helper.session import SessionTiming, ThrottleDetector, VPNSession
 
 
 class FakeTun:
@@ -175,6 +175,58 @@ class FakeClient:
         if self.on_close:
             cb, self.on_close = self.on_close, None
             cb(error)
+
+
+class ThrottleDetectorTests(unittest.TestCase):
+    """A relay that was fast and collapsed to a trickle must be abandoned — trickle bytes
+    used to count as 'progress' and the old stall detector never fired."""
+
+    def _feed(self, d, rate_in_bps, rate_out_bps, seconds, t0=1000.0,
+              base_in=0, base_out=0):
+        """Simulate `seconds` of 1 Hz samples at the given byte/s rates (counters keep
+        growing — as the real ones do within a session)."""
+        for i in range(seconds):
+            t = t0 + i
+            d.observe(t, base_in + int(rate_in_bps * i),
+                      base_out + int(rate_out_bps * i))
+        return t0 + seconds
+
+    def test_quiet_after_fast_download_does_not_trigger(self):
+        d = ThrottleDetector()
+        t = self._feed(d, 500_000, 25_000, 10)     # a fast download
+        for i in range(30):                        # then the user goes idle
+            verdict = d.observe(t + i, 5_000_000, 250_000)
+            self.assertIsNone(verdict, "idle after a download must not rotate")
+
+    def test_collapse_with_demand_triggers_fallback_then_throttle(self):
+        d = ThrottleDetector()
+        t = self._feed(d, 500_000, 25_000, 10)     # fast
+        # collapse: in dead, out still demanding (requests/ACKs/retransmits trickle out)
+        verdicts = []
+        base_in, base_out = 5_000_000, 250_000
+        for i in range(30):
+            verdicts.append(d.observe(t + i, base_in + 200 * i, base_out + 1_500 * i))
+        self.assertIn("fallback", verdicts, "must first leave the degraded UDP path")
+        self.assertIn("throttle", verdicts, "and then abandon the capped relay")
+
+    def test_slow_but_working_session_does_not_trigger(self):
+        d = ThrottleDetector()
+        t = self._feed(d, 3_000, 2_000, 10)        # slow-ish but steady
+        for i in range(30):
+            verdict = d.observe(t + i, 30_000 * (i + 10), 20_000 * (i + 10))
+            self.assertIsNone(verdict, "a working session must not rotate")
+
+    def test_recovers_and_resets_stage(self):
+        d = ThrottleDetector()
+        t = self._feed(d, 500_000, 25_000, 10)
+        base_in, base_out = 5_000_000, 250_000
+        for i in range(25):
+            d.observe(t + i, base_in + 200 * i, base_out + 1_500 * i)
+        self.assertGreater(d.stage, 0)
+        # speed comes back (counters keep growing from where they stopped)
+        self._feed(d, 300_000, 20_000, 25, t0=t + 25,
+                   base_in=base_in + 200 * 25, base_out=base_out + 1_500 * 25)
+        self.assertEqual(d.stage, 0)
 
 
 async def fake_alive(net, captured=True) -> bool:

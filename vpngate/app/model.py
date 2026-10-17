@@ -243,7 +243,8 @@ class AppModel:
         # up, so rotate to the next relay ourselves — disconnect, then the reconnect loop
         # picks the next candidate.
         if (e.state == ConnectionState.connected and e.log
-                and e.log.startswith("The relay stopped sending data")
+                and (e.log.startswith("The relay stopped sending data")
+                     or e.log.startswith("The relay is throttling"))
                 and self._wanted_server is not None and self.active_account is None
                 and self.prefs.get("autoReconnect", True)
                 and self._reconnect_task is None):

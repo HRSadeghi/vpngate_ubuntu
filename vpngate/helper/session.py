@@ -6,6 +6,8 @@ never publishes state and never keeps resources.
 
 from __future__ import annotations
 
+from collections import deque
+
 import asyncio
 import time
 
@@ -29,6 +31,53 @@ class SessionTiming:
         self.max_attempts = 8
         self.min_renew_seconds = 60.0
         self.bridge = BridgeTiming()
+
+
+class ThrottleDetector:
+    """A relay that was fast and then collapsed to a trickle while the app is still
+    demanding traffic — VPN Gate relays cap sessions after some volume. The old stall
+    detector never fires here: trickling bytes keep counting as 'progress'."""
+    WINDOW = 20.0          # seconds of history to judge
+    DEMAND_BYTES = 25_000  # the app is really trying (above keep-alive noise)
+    DEAD_IN_BYTES = 10_000
+    MIN_PEAK_BPS = 15_000  # the session must have been decent before (~120 kbps)
+    FLOOR_BPS = 6_000
+
+    def __init__(self) -> None:
+        self.samples: deque[tuple[float, int, int]] = deque()
+        self.peak_bps = 0.0
+        self.stage = 0
+
+    def observe(self, now: float, bytes_in: int, bytes_out: int) -> str | None:
+        """None | 'fallback' (first collapse: leave UDP) | 'throttle' (still dead: rotate)."""
+        self.samples.append((now, bytes_in, bytes_out))
+        while self.samples and now - self.samples[0][0] > self.WINDOW + 10:
+            self.samples.popleft()
+        if len(self.samples) >= 2:
+            t0, i0, o0 = self.samples[0]
+            dt = now - t0
+            if dt >= 5:
+                rate = ((bytes_in - i0) + (bytes_out - o0)) / dt
+                if rate > self.peak_bps:
+                    self.peak_bps = rate
+        old = None
+        for s in self.samples:
+            if now - s[0] >= self.WINDOW:
+                old = s
+        if old is None:
+            return None
+        t0, i0, o0 = old
+        d_in = bytes_in - i0
+        d_out = bytes_out - o0
+        rate = (d_in + d_out) / max(now - t0, 1.0)
+        if (self.peak_bps >= self.MIN_PEAK_BPS and d_out >= self.DEMAND_BYTES
+                and d_in < self.DEAD_IN_BYTES
+                and rate < max(self.peak_bps / 10, self.FLOOR_BPS)):
+            self.stage += 1
+            return "fallback" if self.stage == 1 else "throttle"
+        if rate >= max(self.peak_bps / 4, self.FLOOR_BPS):
+            self.stage = 0
+        return None
 
 
 class Resources:
@@ -449,11 +498,30 @@ class VPNSession:
             probing = False
             misses = 0
             last_probe = 0.0
+            throttle = ThrottleDetector()
             while True:
                 await asyncio.sleep(1)
                 if not self._is_current(gen):
                     return
                 now = time.monotonic()
+                verdict = throttle.observe(now, client.bytes_in, client.bytes_out)
+                if verdict == "fallback":
+                    accel = getattr(client, "udp_accel", None)
+                    if accel is not None:
+                        accel.force_tcp()
+                    log("[session]", "throughput collapsed — leaving the UDP path "
+                                     "(it degrades after some volume on this network)")
+                elif verdict == "throttle":
+                    total_mb = (client.bytes_in + client.bytes_out) / 1e6
+                    log("[session]", f"relay is throttling this session "
+                                     f"(peak {throttle.peak_bps * 8 / 1e6:.2f}Mbps, "
+                                     f"{total_mb:.1f}MB moved) — switching to another server")
+                    self._current.log = ("The relay is throttling this session (the speed "
+                                         "collapsed after a while). Picking another server…")
+                    self._current.helperVersion = HELPER_VERSION
+                    if self.emit is not None:
+                        self.emit(self._current)
+                    self._current.log = None
                 if client.bytes_in > last_in:
                     last_in = client.bytes_in
                     last_progress = now

@@ -68,6 +68,7 @@ class UdpAccel:
         self._echo_lagged = False
         self._receive_gapped = False
         self._awaiting_data = False
+        self._force_tcp = False
         self._keepalive_task: asyncio.Task | None = None
 
         self.on_frame = None
@@ -128,17 +129,27 @@ class UdpAccel:
         usable = self._usable_state
         if usable != self._last_usable_logged:
             self._last_usable_logged = usable
-            reason = ("echo lag (our datagrams are not arriving)" if self._echo_lagged
-                      else ("no UDP data received yet" if self._awaiting_data
-                            else ("receive gap" if self._receive_gapped else "stable receive period")))
+            reason = ("forced to TCP (the UDP data path collapsed)" if self._force_tcp
+                      else ("echo lag (our datagrams are not arriving)" if self._echo_lagged
+                            else ("no UDP data received yet" if self._awaiting_data
+                                  else ("receive gap" if self._receive_gapped
+                                        else "stable receive period"))))
             log("[udp]", f"acceleration {'USABLE' if usable else 'NOT usable'} ({reason})")
         return usable
+
+    def force_tcp(self) -> None:
+        """The UDP data path collapsed mid-session (heavy loss after some volume): keep
+        the socket for keep-alives but never carry data on it again — TCP recovers where
+        a lossy UDP stream cannot."""
+        self._force_tcp = True
 
     @property
     def _usable_state(self) -> bool:
         self._echo_lagged = False
         self._receive_gapped = False
         self._awaiting_data = False
+        if self._force_tcp:
+            return False
         if self._is_closed or not self.configured or self.last_recv_tick == 0 \
                 or self.first_stable_receive_tick == 0:
             self._receive_gapped = True
