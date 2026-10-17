@@ -178,8 +178,9 @@ class FakeClient:
 
 
 class ThrottleDetectorTests(unittest.TestCase):
-    """A relay that was fast and collapsed to a trickle must be abandoned — trickle bytes
-    used to count as 'progress' and the old stall detector never fired."""
+    """A relay that was fast and collapsed to a trickle must be abandoned — but bursty
+    healthy traffic must never be mistaken for a collapse (it was: the window caught the
+    quiet tail right after a 0.9 Mbps burst and killed a perfectly fine session)."""
 
     def _feed(self, d, rate_in_bps, rate_out_bps, seconds, t0=1000.0,
               base_in=0, base_out=0):
@@ -194,25 +195,46 @@ class ThrottleDetectorTests(unittest.TestCase):
     def test_quiet_after_fast_download_does_not_trigger(self):
         d = ThrottleDetector()
         t = self._feed(d, 500_000, 25_000, 10)     # a fast download
-        for i in range(30):                        # then the user goes idle
+        for i in range(60):                        # then the user goes idle
             verdict = d.observe(t + i, 5_000_000, 250_000)
             self.assertIsNone(verdict, "idle after a download must not rotate")
 
-    def test_collapse_with_demand_triggers_fallback_then_throttle(self):
+    def test_bursty_but_healthy_session_does_not_trigger(self):
+        """The real false positive: 0.9 Mbps bursts with quiet gaps between them."""
+        d = ThrottleDetector()
+        t0 = 1000.0
+        in_c = out_c = 0
+        for i in range(120):
+            t = t0 + i
+            # 5 s burst, 5 s quiet, repeatedly
+            if (i % 10) < 5:
+                in_c += 110_000        # ~0.88 MB/s bursts
+                out_c += 2_500
+            else:
+                out_c += 1_500         # quiet: requests/ACKs trickle
+            verdict = d.observe(t, in_c, out_c)
+            self.assertIsNone(verdict,
+                              f"bursty-but-healthy traffic must not rotate (t={t})")
+
+    def test_collapse_triggers_fallback_then_throttle_after_grace(self):
         d = ThrottleDetector()
         t = self._feed(d, 500_000, 25_000, 10)     # fast
-        # collapse: in dead, out still demanding (requests/ACKs/retransmits trickle out)
-        verdicts = []
         base_in, base_out = 5_000_000, 250_000
-        for i in range(30):
+        verdicts = []
+        for i in range(60):                        # collapse: in dead, out demanding
             verdicts.append(d.observe(t + i, base_in + 200 * i, base_out + 1_500 * i))
         self.assertIn("fallback", verdicts, "must first leave the degraded UDP path")
         self.assertIn("throttle", verdicts, "and then abandon the capped relay")
+        # the throttle must come only after the grace period, not 1 s after the fallback
+        fb = verdicts.index("fallback")
+        th = verdicts.index("throttle")
+        self.assertGreaterEqual(th - fb, int(d.GRACE_AFTER_FALLBACK),
+                                "TCP needs the grace period before the relay is dropped")
 
     def test_slow_but_working_session_does_not_trigger(self):
         d = ThrottleDetector()
         t = self._feed(d, 3_000, 2_000, 10)        # slow-ish but steady
-        for i in range(30):
+        for i in range(60):
             verdict = d.observe(t + i, 30_000 * (i + 10), 20_000 * (i + 10))
             self.assertIsNone(verdict, "a working session must not rotate")
 
@@ -220,12 +242,12 @@ class ThrottleDetectorTests(unittest.TestCase):
         d = ThrottleDetector()
         t = self._feed(d, 500_000, 25_000, 10)
         base_in, base_out = 5_000_000, 250_000
-        for i in range(25):
+        for i in range(35):
             d.observe(t + i, base_in + 200 * i, base_out + 1_500 * i)
         self.assertGreater(d.stage, 0)
         # speed comes back (counters keep growing from where they stopped)
-        self._feed(d, 300_000, 20_000, 25, t0=t + 25,
-                   base_in=base_in + 200 * 25, base_out=base_out + 1_500 * 25)
+        self._feed(d, 300_000, 20_000, 40, t0=t + 35,
+                   base_in=base_in + 200 * 35, base_out=base_out + 1_500 * 35)
         self.assertEqual(d.stage, 0)
 
 

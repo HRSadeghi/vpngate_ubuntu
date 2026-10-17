@@ -36,22 +36,30 @@ class SessionTiming:
 class ThrottleDetector:
     """A relay that was fast and then collapsed to a trickle while the app is still
     demanding traffic — VPN Gate relays cap sessions after some volume. The old stall
-    detector never fires here: trickling bytes keep counting as 'progress'."""
-    WINDOW = 20.0          # seconds of history to judge
-    DEMAND_BYTES = 25_000  # the app is really trying (above keep-alive noise)
-    DEAD_IN_BYTES = 10_000
-    MIN_PEAK_BPS = 15_000  # the session must have been decent before (~120 kbps)
+    detector never fires here: trickling bytes keep counting as 'progress'.
+
+    Bursty-but-healthy traffic (0.9 Mbps bursts with quiet gaps) must NOT trip this:
+    the judgement window is long and a collapse must hold across several checks, with a
+    grace period after leaving UDP so TCP can prove itself before the relay is dropped."""
+    WINDOW = 30.0           # seconds of history to judge (bursty transfers need room)
+    CHECK_EVERY = 5.0       # judge at most this often
+    GRACE_AFTER_FALLBACK = 25.0   # give TCP this long before abandoning the relay
+    DEMAND_BYTES = 40_000   # the app is really trying (above keep-alive noise)
+    DEAD_IN_BYTES = 30_000  # sustained ~1 KB/s — a healthy bursty session is far above
+    MIN_PEAK_BPS = 20_000   # the session must have been decent before (~160 kbps)
     FLOOR_BPS = 6_000
 
     def __init__(self) -> None:
         self.samples: deque[tuple[float, int, int]] = deque()
         self.peak_bps = 0.0
         self.stage = 0
+        self.last_check = 0.0
+        self.stage1_at = 0.0
 
     def observe(self, now: float, bytes_in: int, bytes_out: int) -> str | None:
         """None | 'fallback' (first collapse: leave UDP) | 'throttle' (still dead: rotate)."""
         self.samples.append((now, bytes_in, bytes_out))
-        while self.samples and now - self.samples[0][0] > self.WINDOW + 10:
+        while self.samples and now - self.samples[0][0] > self.WINDOW + 6:
             self.samples.popleft()
         if len(self.samples) >= 2:
             t0, i0, o0 = self.samples[0]
@@ -60,6 +68,9 @@ class ThrottleDetector:
                 rate = ((bytes_in - i0) + (bytes_out - o0)) / dt
                 if rate > self.peak_bps:
                     self.peak_bps = rate
+        if self.last_check and now - self.last_check < self.CHECK_EVERY:
+            return None
+        self.last_check = now
         old = None
         for s in self.samples:
             if now - s[0] >= self.WINDOW:
@@ -70,13 +81,20 @@ class ThrottleDetector:
         d_in = bytes_in - i0
         d_out = bytes_out - o0
         rate = (d_in + d_out) / max(now - t0, 1.0)
-        if (self.peak_bps >= self.MIN_PEAK_BPS and d_out >= self.DEMAND_BYTES
-                and d_in < self.DEAD_IN_BYTES
-                and rate < max(self.peak_bps / 10, self.FLOOR_BPS)):
-            self.stage += 1
-            return "fallback" if self.stage == 1 else "throttle"
-        if rate >= max(self.peak_bps / 4, self.FLOOR_BPS):
+        collapsed = (self.peak_bps >= self.MIN_PEAK_BPS and d_out >= self.DEMAND_BYTES
+                     and d_in < self.DEAD_IN_BYTES
+                     and rate < max(self.peak_bps / 10, self.FLOOR_BPS))
+        if not collapsed:
             self.stage = 0
+            self.stage1_at = 0.0
+            return None
+        if self.stage == 0:
+            self.stage = 1
+            self.stage1_at = now
+            return "fallback"
+        if self.stage == 1 and now - self.stage1_at >= self.GRACE_AFTER_FALLBACK:
+            self.stage = 2
+            return "throttle"
         return None
 
 
