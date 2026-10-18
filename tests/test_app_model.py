@@ -158,6 +158,54 @@ class AppModelWiringTests(unittest.TestCase):
         self.assertEqual(cfg.ports, [443, 992])
         self.assertEqual(cfg.maxConnection, 4)
 
+    def test_disconnect_ack_does_not_cancel_the_rotation(self):
+        """Regression: the helper's ack of the disconnect WE sent to switch relays arrived
+        during the reconnect sleep and overwrote the 'reconnecting' state — the retry then
+        abandoned itself and the app stayed disconnected."""
+        model = self._model()
+        sent: list = []
+        model.helper.send = sent.append
+        model.helper.connect = lambda: True
+        model.helper_is_running = True
+        model.has_agreed_to_disclaimer = True
+        first = VPNServer(hostName="capped.example.com", ip="9.9.9.9", sslPorts=[443], score=5000)
+        second = VPNServer(hostName="alt.example.com", ip="8.8.8.8", sslPorts=[443], score=4000)
+        model.servers = [first, second]
+        model.connect(first)
+        # the throttling watchdog switches servers...
+        model._handle_event(HelperEvent(
+            ConnectionState.connected, server="9.9.9.9", virtualIP="10.0.0.2", bytesIn=1, bytesOut=1,
+            log="The relay is throttling this session (the speed collapsed after a while). "
+                "Picking another server…"))
+        # ...and the helper acks OUR disconnect right in the middle of the wait
+        model._handle_event(HelperEvent(ConnectionState.disconnected))
+        time.sleep(0.3)
+        connects = [r for r in sent if r.cmd == "connect"]
+        self.assertGreaterEqual(len(connects), 2,
+                                "the scheduled rotation must survive the disconnect ack")
+        self.assertEqual(connects[-1].config.host, "8.8.8.8")
+
+    def test_manual_disconnect_stops_the_rotation(self):
+        """A user disconnect must still win: no zombie reconnect after it."""
+        model = self._model()
+        sent: list = []
+        model.helper.send = sent.append
+        model.helper.connect = lambda: True
+        model.helper_is_running = True
+        model.has_agreed_to_disclaimer = True
+        first = VPNServer(hostName="capped.example.com", ip="9.9.9.9", sslPorts=[443], score=5000)
+        second = VPNServer(hostName="alt.example.com", ip="8.8.8.8", sslPorts=[443], score=4000)
+        model.servers = [first, second]
+        model.connect(first)
+        model._handle_event(HelperEvent(
+            ConnectionState.connected, server="9.9.9.9", virtualIP="10.0.0.2", bytesIn=1, bytesOut=1,
+            log="The relay is throttling this session (the speed collapsed after a while). "
+                "Picking another server…"))
+        model.disconnect()
+        time.sleep(0.3)
+        connects = [r for r in sent if r.cmd == "connect"]
+        self.assertEqual(len(connects), 1, "a manual disconnect must stop the rotation")
+
     def test_reconnect_rotates_to_next_relay(self):
         """Relays die constantly; the reconnect loop must rotate through candidates instead of
         hammering the same dead server forever."""

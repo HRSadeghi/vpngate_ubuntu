@@ -33,7 +33,7 @@ from .statistics import VGStatistics
 
 # Wait between reconnect attempts of a VPN Gate connection: the stock account's RetryInterval
 # 0xF (client_exe.c:27590s).
-RECONNECT_INTERVAL = 15.0
+RECONNECT_INTERVAL = 3.0
 HELPER_ANSWER_TIMEOUT = 8.0
 LOG_LIMIT = 300
 
@@ -227,6 +227,12 @@ class AppModel:
     def _handle_event(self, e: HelperEvent) -> None:
         self._last_event_at = time.time()
         self.helper_is_running = True
+        # The ack of the disconnect we sent to switch relays must not cancel the
+        # scheduled rotation: keep showing "reconnecting" until it completes.
+        if (self._reconnect_task is not None and e.state == ConnectionState.disconnected
+                and not e.error and not e.log
+                and self.event.state == ConnectionState.reconnecting):
+            return
         if e.log:
             self.append_log(e.log)
         if e.error:
@@ -323,14 +329,16 @@ class AppModel:
 
         async def wait_and_retry():
             await asyncio.sleep(self.reconnect_delay)
+            # Guarded only by intent, not by the displayed state: the helper's ack of our
+            # own disconnect arrives during this sleep and overwrites `event` with
+            # "disconnected" — checking the state here used to abandon the rotation and
+            # leave the app disconnected. `_wanted_server` is cleared by a manual
+            # disconnect (which also cancels this task).
             if self._wanted_server is None:
                 return
-            if (not self.prefs.get("autoReconnect", True)
-                    or self.event.state != ConnectionState.reconnecting
-                    or not self.helper_is_running):
-                if self.event.state == ConnectionState.reconnecting:
-                    self.event = HelperEvent(ConnectionState.disconnected)
-                    self._changed()
+            if not self.prefs.get("autoReconnect", True) or not self.helper_is_running:
+                self.event = HelperEvent(ConnectionState.disconnected)
+                self._changed()
                 return
             self._send_connect(server)
 
