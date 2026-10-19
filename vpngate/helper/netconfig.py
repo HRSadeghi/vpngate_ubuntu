@@ -147,7 +147,11 @@ class DNSConfigurator:
                             link_servers.append(tok)
         flush()
         for link in self._disabled_links:
-            self.runner.run(resolvectl, ["dns", link])  # clear DNS servers on that link
+            # `resolvectl dns LINK` with no servers only PRINTS the current ones — the
+            # empty string is what actually clears them. Without this the physical link
+            # kept its (poisoning) resolver and systemd-resolved merged its answers with
+            # the tunnel's: one name resolved clean, the next came back poisoned.
+            self.runner.run(resolvectl, ["dns", link, ""])
             self.runner.run(resolvectl, ["default-route", link, "no"])
             _log("[dns]", f"disabled DNS on physical link {link} (prevents leak)")
 

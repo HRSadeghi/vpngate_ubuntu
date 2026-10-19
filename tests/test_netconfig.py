@@ -156,6 +156,25 @@ class NetConfigTests(unittest.TestCase):
         self.assertEqual(self.net.direct_dns_servers(), ["192.168.1.1"],
                          "loopback must never be offered as the physical resolver")
 
+    def test_disable_other_links_actually_clears_the_servers(self):
+        """Regression: `resolvectl dns ens33` (no args) only PRINTS the current servers —
+        the physical link kept its poisoning resolver and systemd-resolved merged its
+        answers with the tunnel's (openrouter.ai came back poisoned, YouTube clean)."""
+        class StatusRunner(RecordingRunner):
+            def run(self, path, args):
+                if "status" in args:
+                    self.calls.append((path, tuple(args)))
+                    return 0, ("Link 2 (ens33):\n  DNS Servers: 192.168.247.2\n"
+                               "Link 18 (tun0):\n  DNS Servers: 127.0.0.1\n")
+                return super().run(path, args)
+
+        r = StatusRunner()
+        dns = DNSConfigurator(r)
+        dns._has_resolved = staticmethod(lambda: True)
+        dns.set(["127.0.0.1"], "tun0", "10.0.0.2", "10.0.0.1")
+        self.assertIn(("dns", "ens33", ""), [tuple(a) for _pp, a in r.calls],
+                      "the clear must pass an empty server string")
+
     def test_disabled_link_dns_restored_explicitly(self):
         """Regression: `revert` alone left the machine with NO resolvers when the manager
         did not re-publish; the captured servers must be set back explicitly."""
@@ -342,7 +361,9 @@ class NetConfigTests(unittest.TestCase):
         # tun0 DNS published
         self.assertIn("dns tun0 8.8.8.8", text)
         # non-tunnel links must be disabled (status shows ens33 has DNS 192.168.247.2)
-        self.assertIn("dns ens33", text)  # cleared (no servers)
+        # `resolvectl dns LINK` with no servers only prints; "" is what clears
+        self.assertIn(("dns", "ens33", ""), [tuple(a) for _pp, a in self.runner.calls],
+                      "the clear must pass an empty server string")
         self.assertIn("default-route ens33 no", text)
         # teardown restores them
         dns2.remove("tun0")
