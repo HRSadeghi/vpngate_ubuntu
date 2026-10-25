@@ -5,6 +5,7 @@ net/dns layers are replaced with recording doubles, so establish() runs end to e
 """
 
 import asyncio
+import time
 import unittest
 
 from vpngate.core.ipcmessages import ConnectConfig, ConnectionState, HelperEvent, ProxySettings
@@ -260,6 +261,35 @@ async def fake_dead(net, captured=True) -> bool:
     return False
 
 
+async def alive_only_before_capture(net, captured=True) -> bool:
+    """Pre-capture probe passes (the relay answers handshakes), every post-capture
+    liveness probe fails (the relay carries no usable data)."""
+    return not captured
+
+
+class TrickleClient(FakeClient):
+    """A relay that sends dust: ~500 B/s of keep-alive echoes and stray DNS replies.
+    Enough to keep the old watchdog's 'progress' flag fresh forever, never enough to
+    load a page."""
+
+    def __init__(self, hub: FakeHub) -> None:
+        super().__init__(hub)
+        self._t0 = time.monotonic()
+
+    @property
+    def bytes_in(self) -> int:
+        return int((time.monotonic() - self._t0) * 500)
+
+    @property
+    def bytes_out(self) -> int:
+        return int((time.monotonic() - self._t0) * 800)
+
+    def stats(self) -> dict:
+        return {"in": self.bytes_in, "out": self.bytes_out, "in_tcp": self.bytes_in,
+                "in_udp": 0, "out_tcp": self.bytes_out, "out_udp": 0, "path": "tcp",
+                "sockets": 4, "udp_usable": False, "udp_negotiated": True, "dropped": 0}
+
+
 class SessionTests(unittest.TestCase):
     def _config(self, **kwargs) -> ConnectConfig:
         defaults = dict(host="vpn.example.com", ports=[443], hubName="VPNGATE", userName="vpn",
@@ -341,6 +371,51 @@ class SessionTests(unittest.TestCase):
             self.assertTrue(any(e.error and "not carrying" in e.error for e in events)
                             or "not carrying" in (session.snapshot.error or ""),
                             f"probe failure must be reported: {events} {session.snapshot}")
+            session.disconnect()
+        self._run(scenario())
+
+    def test_starving_relay_fails_open_and_calls_for_rotation(self):
+        """A relay that trickles dust (a few hundred B/s of keep-alive echoes and stray
+        DNS replies) used to defeat the watchdog twice over: the trickling bytes kept
+        counting as 'progress' so the liveness probe never fired, and when a probe did
+        fire the next tick's trickle reset the miss counter before a second probe could
+        confirm. The inbound-rate judge must catch it, and two failed probes must fail
+        the capture open and tell the app to pick another server."""
+        async def scenario():
+            session = VPNSession(timing=SessionTiming())
+            session.timing.counter_tick = 0.01
+            events: list[HelperEvent] = []
+
+            def capture(e: HelperEvent) -> None:
+                # The session publishes one shared, mutated event object: snapshot the
+                # fields at emit time or the stall message is lost (it is cleared right
+                # after the emit).
+                events.append(HelperEvent(e.state, server=e.server, virtualIP=e.virtualIP,
+                                          log=e.log, error=e.error))
+            session.emit = capture
+
+            hub = FakeHub(None)
+            client = TrickleClient(hub)
+            hub.client = client
+            net = RecordingNet()
+
+            session._make_transport = lambda config, port: client
+            session._make_tun = lambda: FakeTun()  # type: ignore
+            session._make_net = lambda: net  # type: ignore
+            session._tunnel_alive = alive_only_before_capture  # type: ignore
+
+            session.connect_config(self._config())
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                if net.fail_opened and any(e.log and e.log.startswith("The relay stopped sending")
+                                           for e in events):
+                    break
+                await asyncio.sleep(0.02)
+            self.assertTrue(net.fail_opened,
+                            "a starved session must fail open (traffic goes direct)")
+            self.assertTrue(any(e.log and e.log.startswith("The relay stopped sending")
+                                for e in events),
+                            f"the app must be told to rotate: {[e.log for e in events]}")
             session.disconnect()
         self._run(scenario())
 

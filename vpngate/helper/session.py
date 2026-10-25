@@ -24,6 +24,11 @@ from .netconfig import NetConfig
 from .softetherclient import ClientAuth, SoftEtherClient
 from .tun import TunDevice
 
+# Asked through the tunnel when the relay's own resolver does not answer — the relay
+# forwards these just like any other traffic (verified against live relays), and plenty
+# of volunteer relays ship a half-broken home-router resolver.
+_PUBLIC_DNS_FALLBACKS = ("1.1.1.1", "8.8.8.8")
+
 
 class SessionTiming:
     def __init__(self) -> None:
@@ -31,6 +36,9 @@ class SessionTiming:
         self.max_attempts = 8
         self.min_renew_seconds = 60.0
         self.bridge = BridgeTiming()
+        # The throughput counter's tick. Its gates (10-tick no-progress, 5-tick probe gap,
+        # 20-tick starve window) scale with it: 1 s in production, tiny in tests.
+        self.counter_tick = 1.0
 
 
 class ThrottleDetector:
@@ -475,7 +483,8 @@ class VPNSession:
             from .logutil import log
             log("[bypass]", f"setup failed (VPN continues without bypass): {e}")
         if dns_proxy is not None:
-            dns_proxy.tunnel_dns_servers = [ip_string(d) for d in lease.dns]
+            dns_proxy.tunnel_dns_servers = ([ip_string(d) for d in lease.dns]
+                                            + list(_PUBLIC_DNS_FALLBACKS))
             dns_proxy.direct_dns_servers = net.direct_dns_servers()
         # After a cluster redirect the data flows to another host, and UDP acceleration to its
         # own endpoint: both need their own route around the tunnel.
@@ -492,8 +501,9 @@ class VPNSession:
 
         # A relay that accepts the session but carries no data must never blackhole the
         # machine: prove the tunnel works BEFORE the default routes are captured. The
-        # probe is a TCP handshake through the tunnel — without it the dead relay would
-        # take the whole box offline (and every reconnect attempt would too).
+        # probe is a TLS handshake through the tunnel — it needs real data back, so a
+        # relay that only echoes tiny handshake frames fails here. Without it the dead
+        # relay would take the whole box offline (and every reconnect attempt would too).
         if not await self._tunnel_alive(net, captured=False):
             raise RuntimeError("the relay accepted the session but is not carrying any "
                                "traffic (connection test failed)")
@@ -516,12 +526,28 @@ class VPNSession:
             probing = False
             misses = 0
             last_probe = 0.0
+            tick = self.timing.counter_tick
+            window_start = time.monotonic()
+            window_in = client.bytes_in
+            starving = False
+            healthy = False
             throttle = ThrottleDetector()
             while True:
-                await asyncio.sleep(1)
+                await asyncio.sleep(tick)
                 if not self._is_current(gen):
                     return
                 now = time.monotonic()
+                # A relay that trickles (a few hundred bytes/s of keep-alive echoes and
+                # DNS replies) defeats the no-progress watchdog: bytes_in keeps growing
+                # so "last_progress" never goes stale, and the old code probed only when
+                # inbound went fully quiet. Judge the inbound RATE instead — a usable
+                # relay returns kilobytes per second when the app is talking.
+                if now - window_start >= 20 * tick:
+                    rate = (client.bytes_in - window_in) / (now - window_start)
+                    starving = rate < 1500
+                    healthy = rate >= 3000
+                    window_in = client.bytes_in
+                    window_start = now
                 verdict = throttle.observe(now, client.bytes_in, client.bytes_out)
                 if verdict == "fallback":
                     accel = getattr(client, "udp_accel", None)
@@ -543,8 +569,10 @@ class VPNSession:
                 if client.bytes_in > last_in:
                     last_in = client.bytes_in
                     last_progress = now
-                    misses = 0
-                    if fail_opened:
+                    if fail_opened and healthy:
+                        # Recovery needs real volume: a dust trickle (which the relay kept
+                        # sending all along) must not recapture the routes and re-blackhole
+                        # the machine every few seconds.
                         fail_opened = False
                         stall_warned = False
                         try:
@@ -552,7 +580,8 @@ class VPNSession:
                             log("[route]", "traffic is flowing again — capture routes restored")
                         except Exception as e:
                             log("[route]", f"recapture failed: {e}")
-                elif not probing and now - last_progress >= 10 and now - last_probe >= 5:
+                if not probing and (now - last_progress >= 10 * tick or starving) \
+                        and now - last_probe >= 5 * tick:
                     # Quiet does not mean dead (an idle tunnel is healthy): ask the tunnel
                     # directly. Two misses in a row mean the relay is gone or capping.
                     probing = True
@@ -565,6 +594,8 @@ class VPNSession:
                         last_progress = time.monotonic()
                         misses = 0
                     else:
+                        # A dust trickle between probes must NOT reset this counter —
+                        # keep-alive echoes and stray DNS replies are not "carrying data".
                         misses += 1
                         if misses >= 2 and not fail_opened:
                             fail_opened = True
@@ -618,9 +649,14 @@ class VPNSession:
             r.bypass_task = loop.create_task(net.rescan_loop())
 
     async def _default_tunnel_alive(self, net, captured: bool) -> bool:
-        """True when a TCP handshake through the tunnel completes. Before capture
+        """True when a TLS handshake through the tunnel completes. Before capture
         (`captured=False`) temporary host routes push the probe into the tunnel; after
-        capture the default routes already do. Any one target answering is enough."""
+        capture the default routes already do. Any one target answering is enough.
+
+        The probe is deliberately a TLS handshake, not a bare TCP connect: three tiny
+        SYN packets complete even through relays that carry no usable data, while a TLS
+        handshake needs a real ServerHello (kilobytes) back — the minimum a usable relay
+        must deliver."""
         targets = (("1.1.1.1", 443), ("8.8.8.8", 443), ("9.9.9.9", 443))
         if not captured:
             for host, _port in targets:
@@ -628,8 +664,12 @@ class VPNSession:
         try:
             async def one(host: str, port: int) -> bool:
                 try:
+                    import ssl as _ssl
+                    ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_CLIENT)
+                    ctx.check_hostname = False
+                    ctx.verify_mode = _ssl.CERT_NONE
                     _reader, writer = await asyncio.wait_for(
-                        asyncio.open_connection(host, port), 3.0)
+                        asyncio.open_connection(host, port, ssl=ctx), 5.0)
                     try:
                         writer.close()
                     except Exception:

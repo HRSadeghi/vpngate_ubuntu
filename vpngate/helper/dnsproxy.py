@@ -167,6 +167,19 @@ class DNSProxy:
         if self._transport is not None:
             self._transport.sendto(response, addr)
 
+    async def _ask(self, server: str, query: bytes, qtype: int) -> bytes | None:
+        """One DNS exchange with `server`, including the EDNS retry for hostile middleboxes."""
+        response = await self.upstream.query(dnsmessage.strip_do_bit(query), server,
+                                             self.settings.timeout_ms)
+        if response is not None and qtype == 1 and not dnsmessage.resolved_ipv4_addresses(response) \
+                and dnsmessage.header(response) and dnsmessage.header(response)[0] == 0:
+            # Empty A answer: an EDNS-hostile middlebox. Retry as a plain-DNS query.
+            response2 = await self.upstream.query(dnsmessage.strip_edns(query), server,
+                                                  self.settings.timeout_ms)
+            if response2 is not None:
+                response = response2
+        return response
+
     async def handle(self, query: bytes) -> bytes:
         """The decision-and-forward logic for one query, with no socket involved."""
         # A query this helper cannot even parse the name of must never be guessed at: fail closed.
@@ -181,26 +194,18 @@ class DNSProxy:
             return dnsmessage.noerror_nodata_response(query)
         servers = self.direct_dns_servers if (rule is not None and rule.action == RoutingAction.direct) \
             else self.tunnel_dns_servers
-        if not servers:
-            return dnsmessage.servfail_response(query)
-        if validation.is_local_address(servers[0]):
-            # Loopback is the systemd-resolved stub or this proxy itself: asking it would
-            # loop the query forever and wedge the whole system resolver. Fail closed.
+        # Relay resolvers are volunteer home routers — plenty answer half the time or not
+        # at all. Walk the list (the lease's servers first, then public resolvers through
+        # the same tunnel) instead of wedging forever on the first one.
+        usable = [s for s in servers if not validation.is_local_address(s)]
+        if not usable:
             return dnsmessage.servfail_response(query)
         qtype = dnsmessage.query_type(query)
-        # Some upstream resolvers answer DO=1 (EDNS DNSSEC) queries with an empty section;
-        # the same question without the DO bit gets the real records. Nothing here validates
-        # DNSSEC, so the DO bit is simply not forwarded.
-        response = await self.upstream.query(dnsmessage.strip_do_bit(query),
-                                             servers[0], self.settings.timeout_ms)
-        if response is not None and not dnsmessage.resolved_ipv4_addresses(response) \
-                and qtype == 1 and dnsmessage.header(response) \
-                and dnsmessage.header(response)[0] == 0:
-            # Empty A answer: an EDNS-hostile middlebox. Retry as a plain-DNS query.
-            response2 = await self.upstream.query(dnsmessage.strip_edns(query),
-                                                  servers[0], self.settings.timeout_ms)
-            if response2 is not None:
-                response = response2
+        response = None
+        for server in usable:
+            response = await self._ask(server, query, qtype)
+            if response is not None:
+                break
         if response is None:
             return dnsmessage.servfail_response(query)
         # Only for an address a rule explicitly decided on — the structural routes already do
