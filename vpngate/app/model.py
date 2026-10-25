@@ -36,6 +36,9 @@ from .statistics import VGStatistics
 RECONNECT_INTERVAL = 3.0
 HELPER_ANSWER_TIMEOUT = 8.0
 LOG_LIMIT = 300
+# A relay that just died is skipped for this long while other candidates remain —
+# bouncing between two dead relays forever is worse than exploring the rest of the list.
+RELAY_COOLDOWN = 600.0
 
 
 class SetupPrompt:
@@ -99,6 +102,7 @@ class AppModel:
         self._relay_queue: list[VPNServer] = []
         self._current_relay_id: str | None = None
         self._last_failed_id: str | None = None
+        self._failed_relays: dict[str, float] = {}
         self._reconnect_task: asyncio.Task | None = None
         self._history_entry: str | None = None
         self._history_bytes = (0, 0)
@@ -258,6 +262,8 @@ class AppModel:
             self.helper.send(HelperRequest(cmd="disconnect"))
             self.reconnect_attempts += 1
             self._last_failed_id = self._current_relay_id
+            if self._current_relay_id:
+                self._failed_relays[self._current_relay_id] = time.time()
             self._rotate_and_schedule(e.log)
             return
         self._consider_reconnect(e)
@@ -286,13 +292,21 @@ class AppModel:
         return self.servers
 
     def _next_relay(self) -> VPNServer | None:
-        """Pops the next candidate from the failover queue, skipping the relay that just
-        failed; refills from the server list when the queue runs dry."""
+        """Pops the next candidate from the failover queue, skipping relays that just failed
+        or died within the cooldown; refills from the server list when the queue runs dry."""
+        now = time.time()
+
+        def cooling_down(candidate: VPNServer) -> bool:
+            failed_at = self._failed_relays.get(candidate.id)
+            return failed_at is not None and now - failed_at < RELAY_COOLDOWN
+
         while self._relay_queue:
             candidate = self._relay_queue.pop(0)
-            if candidate.id != self._last_failed_id \
-                    and candidate.ip in {s.ip for s in self.servers}:
+            if (candidate.id != self._last_failed_id and not cooling_down(candidate)
+                    and candidate.ip in {s.ip for s in self.servers}):
                 return candidate
+        # Every candidate is cooling down: retrying a recent failure beats sitting
+        # disconnected — refill ignoring the cooldown (but never the relay that just failed).
         self._relay_queue = [c for c in self._relay_candidates()
                              if c.id != self._last_failed_id]
         while self._relay_queue:
@@ -311,6 +325,8 @@ class AppModel:
             return
         self.reconnect_attempts += 1
         self._last_failed_id = self._current_relay_id
+        if self._current_relay_id:
+            self._failed_relays[self._current_relay_id] = time.time()
         self._rotate_and_schedule(e.error)
 
     def _rotate_and_schedule(self, error: str | None) -> None:
@@ -329,6 +345,10 @@ class AppModel:
 
         async def wait_and_retry():
             await asyncio.sleep(self.reconnect_delay)
+            # The scheduled attempt is about to be sent: from here on the task must not
+            # block the next rotation — a completed task object sitting in
+            # _reconnect_task used to make every later failure skip rotating silently.
+            self._reconnect_task = None
             # Guarded only by intent, not by the displayed state: the helper's ack of our
             # own disconnect arrives during this sleep and overwrites `event` with
             # "disconnected" — checking the state here used to abandon the rotation and
@@ -450,6 +470,7 @@ class AppModel:
         self.notice = None
         self._cancel_reconnect()
         self._wanted_server = s
+        self._failed_relays.clear()  # fresh manual intent: every relay gets a new chance
         self.reconnect_attempts = 0
         self._send_connect(s)
 

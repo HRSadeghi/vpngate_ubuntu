@@ -250,6 +250,59 @@ class AppModelWiringTests(unittest.TestCase):
         self.assertTrue(any(r.cmd == "disconnect" for r in sent))
         self.assertEqual(sent[-1].config.host, "8.8.8.8")
 
+    def test_rotation_keeps_rotating_after_the_first_switch(self):
+        """Regression: the reconnect task object was never cleared once the scheduled
+        rotation sent its connect — every later failure then saw "_reconnect_task is not
+        None" and the app silently stopped rotating (sat disconnected until a manual
+        connect)."""
+        model = self._model()
+        sent: list = []
+        model.helper.send = sent.append
+        model.helper.connect = lambda: True
+        model.helper_is_running = True
+        model.has_agreed_to_disclaimer = True
+        first = VPNServer(hostName="dead1.example.com", ip="9.9.9.9", sslPorts=[443], score=5000)
+        second = VPNServer(hostName="dead2.example.com", ip="8.8.8.8", sslPorts=[443], score=4000)
+        model.servers = [first, second]
+        model.connect(first)
+        self.assertEqual(sent[0].config.host, "9.9.9.9")
+        # the first relay dies → rotation to the second one
+        model._handle_event(HelperEvent(ConnectionState.disconnected, error="Connection closed"))
+        time.sleep(0.3)
+        self.assertEqual(sent[-1].config.host, "8.8.8.8")
+        # the second relay dies too → the app must keep rotating (back to the first relay
+        # here: every other candidate is exhausted), never just sit disconnected
+        model._handle_event(HelperEvent(ConnectionState.disconnected,
+                                        error="Read idle timeout (20000 ms)"))
+        time.sleep(0.3)
+        connects = [r.config.host for r in sent if r.cmd == "connect"]
+        self.assertGreaterEqual(len(connects), 3,
+                                f"the app must keep rotating after repeated failures: {connects}")
+
+    def test_rotation_avoids_recently_failed_relays(self):
+        """With three relays and two dead ones, the rotation must reach the third relay
+        instead of bouncing between the two dead ones forever."""
+        model = self._model()
+        sent: list = []
+        model.helper.send = sent.append
+        model.helper.connect = lambda: True
+        model.helper_is_running = True
+        model.has_agreed_to_disclaimer = True
+        a = VPNServer(hostName="a.example.com", ip="9.9.9.9", sslPorts=[443], score=5000)
+        b = VPNServer(hostName="b.example.com", ip="8.8.8.8", sslPorts=[443], score=4000)
+        c = VPNServer(hostName="c.example.com", ip="7.7.7.7", sslPorts=[443], score=3000)
+        model.servers = [a, b, c]
+        model.connect(a)
+        self.assertEqual(sent[0].config.host, "9.9.9.9")
+        model._handle_event(HelperEvent(ConnectionState.disconnected, error="Connection closed"))
+        time.sleep(0.3)
+        self.assertEqual(sent[-1].config.host, "8.8.8.8")
+        model._handle_event(HelperEvent(ConnectionState.disconnected,
+                                        error="Read idle timeout (20000 ms)"))
+        time.sleep(0.3)
+        self.assertEqual(sent[-1].config.host, "7.7.7.7",
+                         "a relay that just failed must not be retried before the others")
+
     def test_remove_bypass_app_updates_ui(self):
         """Regression: the Remove button removed from the data but never rebuilt the rows."""
         from vpngate.app.ui.routing import RoutingRulesEditor
